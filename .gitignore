@@ -1,3 +1,5 @@
 inventorycleanupandimport/
 reports/
 logs/
+__pycache__/
+medicentre_config.json

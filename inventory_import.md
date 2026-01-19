@@ -14,7 +14,9 @@ This document explains what `inventory_import.py` does, how to run it, what inpu
 
 **Files**
 
-- `inventory_import.py` — Primary implementation containing the `MedicentreEnhancedImporter` class.
+- `inventory_import.py` — Primary implementation containing the `MedicentreV3InventoryImporter` class.
+- `config_loader.py` — Configuration management utility for loading, creating, and saving Medicentre settings.
+- `manage_config.py` — Interactive configuration manager for viewing and updating settings.
 - `inventory_cleaner.py` — Related script that produces the cleaned CSV input (see `inventory_cleaner.md`).
 - Output directories created at runtime:
   - `logs/` — Contains timestamped log files and screenshots
@@ -116,7 +118,7 @@ The script will prompt for all required information:
 
 ```
 ============================================================
-MEDICENTRE v3 ENHANCED INVENTORY IMPORTER
+MEDICENTRE v3 INVENTORY IMPORTER
 ============================================================
 
 --- Configuration ---
@@ -147,13 +149,23 @@ Proceed with import? (y/n): y
 For integration or automated runs, you can instantiate the importer directly:
 
 ```python
-from inventory_import import MedicentreEnhancedImporter
+from inventory_import import MedicentreV3InventoryImporter
 
 # Configuration
 config = {
     "headless": True,
     "storage_location": "Main Store",
-    "default_department": "Pharmacy"
+    "default_department": "Pharmacy",
+    "account_mappings": {
+        "inventory_main": "Inventory",
+        "inventory_class": "Current Assets",
+        "revenue_main": "Revenue", 
+        "revenue_class": "Income",
+        "cost_main": "Cost of Goods Sold",
+        "cost_class": "Cost of Goods Sold"
+    },
+    "vat_default_rate": 16,
+    "vat_default_tax_code": "E"
 }
 
 # Credentials
@@ -165,7 +177,7 @@ credentials = {
 }
 
 # Create importer
-importer = MedicentreEnhancedImporter(
+importer = MedicentreV3InventoryImporter(
     base_url="https://medicentre.example.com",
     credentials=credentials,
     config=config,
@@ -174,6 +186,53 @@ importer = MedicentreEnhancedImporter(
 
 # Run import
 stats = importer.import_data("cleaned_inventory.csv")
+```
+
+---
+
+**Configuration Management**
+
+The importer uses a JSON-based configuration system for persistent settings:
+
+- `medicentre_config.json` — Stores all configuration including credentials, URLs, and mappings
+- `config_loader.py` — Utility class for loading, creating, and saving configurations
+- `manage_config.py` — Interactive tool for managing configuration files
+
+**Using Configuration Files:**
+
+```bash
+# Create new configuration interactively
+py manage_config.py
+# Select option 1 to create new config
+
+# Or load existing config in importer
+py inventory_import.py
+# Select "Load existing configuration? (y/n): y"
+```
+
+**Configuration Structure:**
+```json
+{
+  "base_url": "https://medicentre.example.com",
+  "accesscode": "ABC123",
+  "branch": "Main Branch",
+  "username": "admin",
+  "password": "secret",
+  "headless": true,
+  "storage_location": "Main Store",
+  "default_department": "Pharmacy",
+  "account_mappings": {
+    "inventory_main": "Inventory",
+    "inventory_class": "Current Assets",
+    "revenue_main": "Revenue",
+    "revenue_class": "Income",
+    "cost_main": "Cost of Goods Sold",
+    "cost_class": "Cost of Goods Sold"
+  },
+  "vat_default_rate": 16,
+  "vat_default_tax_code": "E",
+  "last_csv_path": "cleaned_inventory.csv"
+}
 ```
 
 ---
@@ -268,6 +327,51 @@ pip install selenium
 
 # Ensure Edge browser is installed
 # WebDriver is managed automatically by selenium
+```
+
+**Configuration Management**
+
+The importer uses a JSON-based configuration system for persistent settings:
+
+- `medicentre_config.json` — Stores all configuration including credentials, URLs, and mappings
+- `config_loader.py` — Utility class for loading, creating, and saving configurations
+- `manage_config.py` — Interactive tool for managing configuration files
+
+**Using Configuration Files:**
+
+```bash
+# Create new configuration interactively
+py manage_config.py
+# Select option 1 to create new config
+
+# Or load existing config in importer
+py inventory_import.py
+# Select "Load existing configuration? (y/n): y"
+```
+
+**Configuration Structure:**
+```json
+{
+  "base_url": "https://medicentre.example.com",
+  "accesscode": "ABC123",
+  "branch": "Main Branch",
+  "username": "admin",
+  "password": "secret",
+  "headless": true,
+  "storage_location": "Main Store",
+  "default_department": "Pharmacy",
+  "account_mappings": {
+    "inventory_main": "Inventory",
+    "inventory_class": "Current Assets",
+    "revenue_main": "Revenue",
+    "revenue_class": "Income",
+    "cost_main": "Cost of Goods Sold",
+    "cost_class": "Cost of Goods Sold"
+  },
+  "vat_default_rate": 16,
+  "vat_default_tax_code": "E",
+  "last_csv_path": "cleaned_inventory.csv"
+}
 ```
 
 ---

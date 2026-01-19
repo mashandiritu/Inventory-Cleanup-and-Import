@@ -1,7 +1,8 @@
 import csv
+from logging import config
 import time
 import logging
-import os
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from selenium import webdriver
@@ -11,22 +12,22 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (NoSuchElementException)
 from datetime import datetime
+from config_loader import ConfigLoader
 import json
 
 
-class MedicentreEnhancedImporter:
+class MedicentreV3InventoryImporter:
     """Enhanced Medicentre v3 Inventory Importer with robust prerequisite verification"""
 
     def __init__(
-        self, base_url: str, credentials: Dict, config: Dict, dry_run: bool = False
-    ):
-        """
-        Initialize enhanced importer
-
+    self, base_url: str, credentials: Dict, config: Dict, dry_run: bool = False
+):
+        """Initialize enhanced importer
+    
         Args:
             base_url: Medicentre v3 base URL
             credentials: Dictionary with accesscode, username, password, branch
-            config: Configuration dictionary (must include 'storage_location')
+            config: Configuration dictionary with all settings
             dry_run: If True, only validate without importing
         """
         self.base_url = base_url.rstrip("/")
@@ -38,8 +39,35 @@ class MedicentreEnhancedImporter:
         self.logger = self.setup_logging()
         self.session_active = False
 
-        # Validate required config
-        if "storage_location" not in config:
+        # Validate credentials
+        required_credentials = ['accesscode', 'branch', 'username', 'password']
+        missing_creds = [cred for cred in required_credentials if not self.credentials.get(cred)]
+        if missing_creds:
+            self.logger.warning(f"Missing credentials: {missing_creds}")
+
+        # Store account mappings from config with validation
+        default_mappings = {
+            'inventory_main': 'Inventory',
+            'inventory_class': 'Current Assets',
+            'revenue_main': 'Revenue',
+            'revenue_class': 'Income',
+            'cost_main': 'Cost of Goods Sold',
+            'cost_class': 'Cost of Goods Sold'
+        }
+    
+        self.account_mappings = config.get("account_mappings", {})
+        # Fill in any missing keys with defaults
+        for key, default_value in default_mappings.items():
+            if key not in self.account_mappings or not self.account_mappings[key]:
+                self.account_mappings[key] = default_value
+                self.logger.info(f"Using default for {key}: {default_value}")
+
+        # Store VAT defaults
+        self.vat_default_rate = config.get("vat_default_rate", 16)
+        self.vat_default_tax_code = config.get("vat_default_tax_code", "E")
+    
+        # Store storage location
+        if "storage_location" not in config or not config["storage_location"]:
             self.logger.warning("storage_location not in config, using default")
             config["storage_location"] = "Main Store"
 
@@ -197,35 +225,35 @@ class MedicentreEnhancedImporter:
                 self.driver = None
             return self.login()
 
-    def navigate_to_module(self, module_path: List[str]) -> bool:
-        """Navigate through menu hierarchy to target module"""
-        try:
-            if not self.check_session():
-                return False
+    # def navigate_to_module(self, module_path: List[str]) -> bool:
+    #     """Navigate through menu hierarchy to target module"""
+    #     try:
+    #         if not self.check_session():
+    #             return False
 
-            self.logger.info(f"Navigating to: {' → '.join(module_path)}")
+    #         self.logger.info(f"Navigating to: {' → '.join(module_path)}")
 
-            # Handle specific navigation based on target module
-            if module_path == ["Inventory", "Inventory"]:
-                return self.navigate_to_inventory_items()
-            elif module_path == ["Inventory", "Inventory Setup", "Item Categories"]:
-                return self.navigate_to_item_categories()
-            elif module_path == ["Inventory", "Inventory Setup", "Item Classes"]:
-                return self.navigate_to_item_classes()
-            elif module_path == ["Inventory", "Unit of Measure"]:
-                return self.navigate_to_unit_of_measure()
-            elif module_path == ["Accounts", "Chart of Accounts"]:
-                return self.navigate_to_chart_of_accounts()
-            elif module_path == ["Accounts", "Taxes"]:
-                return self.navigate_to_taxes()
-            else:
-                self.logger.error(f"Unknown module path: {module_path}")
-                return False
+    #         # Handle specific navigation based on target module
+    #         if module_path == ["Inventory", "Inventory"]:
+    #             return self.navigate_to_inventory_items()
+    #         elif module_path == ["Inventory", "Inventory Setup", "Item Categories"]:
+    #             return self.navigate_to_item_categories()
+    #         elif module_path == ["Inventory", "Inventory Setup", "Item Classes"]:
+    #             return self.navigate_to_item_classes()
+    #         elif module_path == ["Inventory", "Unit of Measure"]:
+    #             return self.navigate_to_unit_of_measure()
+    #         elif module_path == ["Accounts", "Chart of Accounts"]:
+    #             return self.navigate_to_chart_of_accounts()
+    #         elif module_path == ["Accounts", "Taxes"]:
+    #             return self.navigate_to_taxes()
+    #         else:
+    #             self.logger.error(f"Unknown module path: {module_path}")
+    #             return False
 
-        except Exception as e:
-            self.logger.error(f"✗ Navigation failed to {module_path}: {str(e)}")
-            self.take_screenshot(f"navigation_error_{'_'.join(module_path)}")
-            return False
+    #     except Exception as e:
+    #         self.logger.error(f"✗ Navigation failed to {module_path}: {str(e)}")
+    #         self.take_screenshot(f"navigation_error_{'_'.join(module_path)}")
+    #         return False
 
     # ==================== CHART OF ACCOUNTS PANEL ====================
 
@@ -650,48 +678,54 @@ class MedicentreEnhancedImporter:
             return None
 
     def get_main_account_configuration(self) -> Dict:
-        """Get user configuration for main accounts"""
+        """Get user configuration for main accounts from config or prompt"""
         print("\n" + "="*60)
         print("MAIN ACCOUNT CONFIGURATION")
         print("="*60)
     
-        # Show what the CSV contains
+        # Check if we have account mappings in config
+        if self.account_mappings and all(self.account_mappings.values()):
+            print("\nUsing account mappings from configuration:")
+            for key, value in self.account_mappings.items():
+                print(f"  {key}: {value}")
+        
+            confirm = input("\nUse these account mappings? (y/n): ").strip().lower()
+            if confirm in ['y', 'yes']:
+                return self.account_mappings
+    
+        # If no config or user wants to change, proceed with interactive setup
         print("\nThe CSV contains sub-accounts that need to be mapped to main accounts.")
         print("\nYou need to specify which existing main accounts these sub-accounts")
         print("should be created under, or we can create new main accounts.")
         print("="*60)
     
-        config = {}
-    
-        # Option 1: Auto-detect existing main accounts
-        print("\nWould you like to:")
-        print("  1. Let me check existing main accounts and suggest matches")
-        print("  2. Manually specify main account names")
-        print("  3. Use default main accounts")
-    
         while True:
+            print("\nWould you like to:")
+            print("  1. Let me check existing main accounts and suggest matches")
+            print("  2. Manually specify main account names")
+            print("  3. Use default main accounts")
+        
             choice = input("\nSelect option (1-3): ").strip()
-    
+
             if choice == "1":
                 # Auto-detect and suggest
                 config = self.auto_detect_main_accounts()
                 if config:
                     return config
                 else:
-                    print("Could not auto-detect. Please specify manually.")
-                    # Fall through to manual specification
-    
-            if choice == "2" or choice == "1":
+                    print("Could not auto-detect. Returning to menu...")
+                    continue  # Go back to menu instead of falling through
+
+            elif choice == "2":
                 # Manual specification
                 return self.get_manual_main_account_config()
-    
+
             elif choice == "3":
                 # Use defaults
                 return self.get_default_main_account_config()
-    
+
             else:
                 print("Invalid choice. Please enter 1, 2, or 3.")
-    
 
     def auto_detect_main_accounts(self) -> Dict:
         """Try to auto-detect existing main accounts by scanning the table"""
@@ -1284,7 +1318,7 @@ class MedicentreEnhancedImporter:
             return False
 
     def verify_and_create_units_in_panel(self, csv_data: List[Dict]) -> bool:
-        """Verify and create Units of Measure in the Unit of Measure panel"""
+        """Verify and create Units of Measure in the Unit of Measure panel with search support"""
         try:
             if not self.navigate_to_unit_of_measure():
                 return False
@@ -1295,33 +1329,18 @@ class MedicentreEnhancedImporter:
 
             # Extract unique units from CSV and normalize to Title Case
             csv_units = {row["UnitOfMeasure"].strip().title() for row in csv_data}
-
-            # Get existing units from the panel (normalized to Title Case)
-            existing_units = set()
-            try:
-                # Get all unit rows in the panel
-                time.sleep(2)
-                unit_rows = self.driver.find_elements(By.XPATH, "//table[@id='unitofmeasurestable']/tbody/tr")
-                for row in unit_rows[:150]:  # Limit for performance
-                    try:
-                        unit_cells = row.find_elements(By.TAG_NAME, "td")
-                        if unit_cells:
-                            unit_name = unit_cells[1].text.strip()
-                            if unit_name:
-                                existing_units.add(unit_name.title())
-                    except:
-                        continue
-                self.logger.info(f"Found {len(existing_units)} existing units in panel")
-            except Exception as e:
-                self.logger.warning(f"Could not fetch existing units from panel: {e}")
+            self.logger.info(f"Looking for {len(csv_units)} units from CSV")
 
             units_verified = 0
             units_created = 0
 
             for unit in csv_units:
-                if unit in existing_units:
+                # Check if unit exists using search + row scanning
+                unit_exists = self.check_unit_exists_with_search(unit)
+
+                if unit_exists:
                     self.logger.info(
-                        f"✓ Unit of measure '{unit}' exists in panel (normalized)"
+                        f"✓ Unit of measure '{unit}' exists in panel"
                     )
                     units_verified += 1
                 else:
@@ -1337,19 +1356,27 @@ class MedicentreEnhancedImporter:
                                     )
                                 )
                             )
+                            unit_field.clear()
                             unit_field.send_keys(unit)
 
-                            measurement_unit_select = Select(self.driver.find_element(
-                                By.XPATH, "//select[@id='UnitOfMeasure_MeasurementUnit']"
-                            ))
-                            measurement_unit_select.select_by_visible_text("Pieces")
-                            time.sleep(1)
+                            # Select measurement unit
+                            try:
+                                measurement_unit_select = Select(self.driver.find_element(
+                                    By.XPATH, "//select[@id='UnitOfMeasure_MeasurementUnit']"
+                                ))
+                                measurement_unit_select.select_by_visible_text("Pieces")
+                            except:
+                                self.logger.warning("Could not set measurement unit")
 
-                            packaging_unit_select = Select(self.driver.find_element(
-                                By.XPATH, "//select[@id='UnitOfMeasure_PackagingUnit']"
-                            ))
-                            time.sleep(1)
-                            packaging_unit_select.select_by_visible_text("Net")
+                            # Select packaging unit
+                            try:
+                                packaging_unit_select = Select(self.driver.find_element(
+                                    By.XPATH, "//select[@id='UnitOfMeasure_PackagingUnit']"
+                                ))
+                                # Try to select first option
+                                packaging_unit_select.select_by_index(1)
+                            except:
+                                self.logger.warning("Could not set packaging unit")
 
                             # Save in the panel
                             save_button = self.driver.find_element(
@@ -1357,25 +1384,26 @@ class MedicentreEnhancedImporter:
                                 "//button[@id='btnaddunitofmeasure']",
                             )
                             save_button.click()
-                            time.sleep(3)
+                            time.sleep(2)  # Wait for creation
 
-                            # Verify creation in the panel
-                            try:
-                                self.driver.find_element(
-                                    By.XPATH, f"//tr[td[contains(text(), '{unit}')]]"
-                                )
+                            # VERIFICATION: Check if unit was created using search
+                            created = False
+                            for attempt in range(3):  # Try 3 times
+                                time.sleep(1)
+                                if self.check_unit_exists_with_search(unit):
+                                    created = True
+                                    break
+                        
+                            if created:
                                 self.logger.info(
                                     f"✓ Created unit of measure in panel: {unit}"
                                 )
                                 units_created += 1
 
-                                # Add to existing units for subsequent checks
-                                existing_units.add(unit)
-
-                                # Navigate back to main list
-                                self.navigate_to_unit_of_measure()
-
-                            except NoSuchElementException:
+                                # Clear any search filter to show all items again
+                                self.clear_unit_search()
+                            
+                            else:
                                 self.logger.error(
                                     f"✗ Failed to verify creation of unit '{unit}' in panel"
                                 )
@@ -1396,8 +1424,9 @@ class MedicentreEnhancedImporter:
 
             self.verification_stats["units_verified"] = units_verified
             self.verification_stats["units_created"] = units_created
+
             self.logger.info(
-                f"✓ Unit of Measure verification complete in panel: {units_verified} verified, {units_created} created"
+                f"✓ Unit of Measure verification complete: {units_verified} verified, {units_created} created"
             )
             return True
 
@@ -1407,6 +1436,176 @@ class MedicentreEnhancedImporter:
             )
             self.take_screenshot("unit_of_measure_panel_error")
             return False
+    
+    def check_unit_exists_with_search(self, unit_name: str) -> bool:
+        """Check if a unit exists using table search and row scanning"""
+        try:
+            # First try to use search if available
+            if self.search_unit_in_table(unit_name):
+                return True
+        
+            # If search not available or didn't work, fall back to full table scan
+            return self.scan_unit_table_for_match(unit_name)
+        
+        except Exception as e:
+            self.logger.debug(f"Error checking unit existence: {e}")
+            return False
+
+    def search_unit_in_table(self, unit_name: str) -> bool:
+        """Use the table search feature to find a unit"""
+        try:
+            # Look for search input - common selectors for DataTables
+            search_selectors = [
+                "input[aria-controls='unitofmeasurestable']",
+                "//input[@aria-controls='unitofmeasurestable']",
+                "(//input[@aria-controls='unitofmeasurestable'])[1]",
+            ]
+        
+            search_box = None
+            for selector in search_selectors:
+                try:
+                    search_box = self.driver.find_element(By.XPATH, selector)
+                    if search_box.is_displayed():
+                        self.logger.debug(f"Found search box with selector: {selector}")
+                        break
+                except:
+                    continue
+        
+            if not search_box:
+                self.logger.debug("No search box found in units panel")
+                return False
+        
+            # Use search
+            search_box.clear()
+            search_box.send_keys(unit_name)
+            time.sleep(1)  # Wait for table to filter
+        
+            # Check if any rows appear in the filtered table
+            try:
+                # Find the table
+                table_selectors = [
+                    "#unitofmeasurestable",
+                    "//table[@id='unitofmeasurestable']",
+                    "(//table[@id='unitofmeasurestable'])[1]",
+                ]
+            
+                table = None
+                for selector in table_selectors:
+                    try:
+                        table = self.driver.find_element(By.XPATH, selector)
+                        break
+                    except:
+                        continue
+            
+                if not table:
+                    return False
+            
+                # Get filtered rows
+                rows = table.find_elements(By.XPATH, "//table[@id='unitofmeasurestable']/tbody/tr")
+                if not rows:
+                    rows = table.find_elements(By.XPATH, ".//tr[td]")  # Skip header
+            
+                # Check if any row contains the exact unit name
+                for row in rows:
+                    try:
+                        cells = row.find_elements(By.TAG_NAME, "td")
+                        if cells:
+                            # Get unit name in second column
+                            cell_text = cells[1].text.strip()
+                            if cell_text.lower() == unit_name.lower():
+                                self.logger.debug(f"Found unit '{unit_name}' via search")
+                                return True
+                    except:
+                        continue
+            
+                return False
+            
+            finally:
+                # Always clear the search to not affect subsequent operations
+                search_box.clear()
+                time.sleep(0.5)
+            
+        except Exception as e:
+            self.logger.debug(f"Error during unit search: {e}")
+            return False
+
+    def scan_unit_table_for_match(self, unit_name: str) -> bool:
+        """Scan the entire unit table for a match"""
+        try:
+            # Find the table
+            table_selectors = [
+                "#unitofmeasurestable",
+                "//table[@id='unitofmeasurestable']",
+                "(//table[@id='unitofmeasurestable'])[1]",
+            ]
+        
+            table = None
+            for selector in table_selectors:
+                try:
+                    table = self.driver.find_element(By.XPATH, selector)
+                    break
+                except:
+                    continue
+        
+            if not table:
+                self.logger.warning("Unit table not found")
+                return False
+        
+            # Get all rows
+            try:
+                rows = table.find_elements(By.XPATH, "//table[@id='unitofmeasurestable']/tbody/tr")
+            except:
+                rows = table.find_elements(By.XPATH, ".//tr")
+        
+            self.logger.debug(f"Scanning {len(rows)} rows for unit '{unit_name}'")
+        
+            # Scan each row
+            for row in rows:
+                try:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if cells:
+                        # Unit name in second column
+                        cell_text = cells[1].text.strip()
+                    
+                        # Exact match
+                        if cell_text.lower() == unit_name.lower():
+                            self.logger.debug(f"Found unit '{unit_name}' in table")
+                            return True
+                    
+                        # Partial match (in case of extra formatting)
+                        if unit_name.lower() in cell_text.lower():
+                            self.logger.debug(f"Found partial match: '{cell_text}' for '{unit_name}'")
+                            return True
+                except Exception as e:
+                    self.logger.debug(f"Error checking row: {e}")
+                    continue
+        
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error scanning unit table: {e}")
+            return False
+
+    def clear_unit_search(self):
+        """Clear any active search in the units table"""
+        try:
+            search_selectors = [
+                "#unitofmeasurestable",
+                "//table[@id='unitofmeasurestable']",
+                "(//table[@id='unitofmeasurestable'])[1]",
+            ]
+        
+            for selector in search_selectors:
+                try:
+                    search_box = self.driver.find_element(By.XPATH, selector)
+                    search_box.clear()
+                    search_box.send_keys(Keys.RETURN)  # Trigger search to show all
+                    time.sleep(0.5)
+                    break
+                except:
+                    continue
+        except:
+            pass  # Silently fail if search can't be cleared
 
     # ==================== ITEM CATEGORIES PANEL VIA SERVICES PANEL ====================
 
@@ -1459,38 +1658,7 @@ class MedicentreEnhancedImporter:
 
             # Extract unique categories from CSV and normalize to Title Case
             csv_categories = {row["ItemCategory"].strip().title() for row in csv_data}
-
-            # Get existing categories from the modal (normalized to Title Case)
-            existing_categories = set()
-            try:
-                time.sleep(2)
-                self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, "//table[@id='itemcategoriestable']"))
-                )
-
-                category_rows = self.driver.find_elements(By.XPATH, "//table[@id='itemcategoriestable']/tbody/tr")
-                for row in category_rows[:100]:
-                    try:
-                        category_cells = row.find_elements(By.TAG_NAME, "td")
-                        if len(category_cells) > 2:
-                            category_name = category_cells[1].text.strip()
-                            if category_name and category_name.lower() != "name":
-                                existing_categories.add(category_name.title())
-                                self.logger.debug(
-                                    f"Found existing category: {category_name}"
-                                )
-                    except Exception as cell_error:
-                        self.logger.debug(f"Error processing row: {cell_error}")
-                        continue
-
-                self.logger.info(
-                    f"Found {len(existing_categories)} existing categories in modal"
-                )
-            except Exception as e:
-                self.logger.warning(
-                    f"Could not fetch existing categories from modal: {e}"
-                )
-                self.take_screenshot("categories_table_error")
+            self.logger.info(f"Looking for {len(csv_categories)} categories from CSV")
 
             categories_verified = 0
             categories_created = 0
@@ -1499,9 +1667,12 @@ class MedicentreEnhancedImporter:
             default_department = self.config.get("default_department", "Pharmacy")
 
             for category in csv_categories:
-                if category in existing_categories:
+                # Check if category exists by looping through table rows
+                category_exists = self.check_category_exists_by_row_scan(category)
+
+                if category_exists:
                     self.logger.info(
-                        f"✓ Item category '{category}' exists in modal (normalized)"
+                        f"✓ Item category '{category}' exists in modal"
                     )
                     categories_verified += 1
                 else:
@@ -1515,6 +1686,7 @@ class MedicentreEnhancedImporter:
                                     (By.XPATH, "//input[@id='ItemCategory_Name']")
                                 )
                             )
+                            category_name_field.clear()
                             category_name_field.send_keys(category)
 
                             # 2. Department field
@@ -1535,16 +1707,6 @@ class MedicentreEnhancedImporter:
                                 self.logger.warning(
                                     f"Could not set department: {dept_error}"
                                 )
-                                # Try alternative approach
-                                try:
-                                    department_field = self.driver.find_element(
-                                        By.ID, "ItemCategory_DepartmentID"
-                                    )
-                                    department_field.send_keys(default_department)
-                                except:
-                                    self.logger.warning(
-                                        "Department field not found or not settable"
-                                    )
 
                             # 3. Click Add Category button in the modal
                             add_button = self.wait.until(
@@ -1553,23 +1715,22 @@ class MedicentreEnhancedImporter:
                                 )
                             )
                             add_button.click()
-                            time.sleep(2)
+                            time.sleep(2)  # Wait for creation
 
-                            # Verify creation in the modal
-                            try:
-                                self.driver.find_element(
-                                    By.XPATH,
-                                    f"//tr[td[contains(text(), '{category}')]]",
-                                )
+                            # VERIFICATION: Check if category was created by scanning rows
+                            created = False
+                            for attempt in range(3):  # Try 3 times
+                                time.sleep(1)  # Wait for table to update
+                                if self.check_category_exists_by_row_scan(category):
+                                    created = True
+                                    break
+                        
+                            if created:
                                 self.logger.info(
                                     f"✓ Created item category in modal: {category}"
                                 )
                                 categories_created += 1
-
-                                # Add to existing categories for subsequent checks
-                                existing_categories.add(category)
-
-                            except NoSuchElementException:
+                            else:
                                 self.logger.error(
                                     f"✗ Failed to verify creation of category '{category}' in modal"
                                 )
@@ -1592,12 +1753,12 @@ class MedicentreEnhancedImporter:
 
             self.verification_stats["categories_verified"] = categories_verified
             self.verification_stats["categories_created"] = categories_created
-            
+        
             # Close the item categories modal after processing
             self.close_item_categories_modal()
-            
+
             self.logger.info(
-                f"✓ Item Categories verification complete in modal: {categories_verified} verified, {categories_created} created"
+                f"✓ Item Categories verification complete: {categories_verified} verified, {categories_created} created"
             )
             return True
 
@@ -1608,6 +1769,67 @@ class MedicentreEnhancedImporter:
             self.take_screenshot("item_categories_modal_error")
             return False
 
+    def check_category_exists_by_row_scan(self, category_name: str) -> bool:
+        """Check if a category exists by scanning table rows (similar to sub-accounts method)"""
+        try:
+            # Try different table selectors
+            table_selectors = [
+                "//table[@id='itemcategoriestable']",
+                "#itemcategoriestable",
+                "(//table[@id='itemcategoriestable'])[1]"
+            ]
+        
+            table = None
+            for selector in table_selectors:
+                try:
+                    table = self.driver.find_element(By.XPATH, selector)
+                    break
+                except:
+                    continue
+        
+            if not table:
+                self.logger.warning("Category table not found")
+                return False
+        
+            # Get all rows in the table - THIS IS THE KEY PART
+            try:
+                rows = table.find_elements(By.XPATH, "//table[@id='itemcategoriestable']/tbody/tr")
+            except:
+                # If no tbody, try without it
+                rows = table.find_elements(By.XPATH, ".//tr")
+        
+            self.logger.debug(f"Scanning {len(rows)} rows for category '{category_name}'")
+
+            # Scan through each row
+            for row in rows:
+                try:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if cells and len(cells) >= 2:  # Need at least 2 columns
+                        # Try different column indices - usually Name is in second column
+                        cell_text = cells[1].text.strip() if len(cells) > 1 else cells[0].text.strip()
+                    
+                        if cell_text.lower() == category_name.lower():
+                            self.logger.debug(f"Found category '{category_name}' in table")
+                            return True
+                        
+                        # Also check for partial matches (in case of extra spaces, etc.)
+                        if category_name.lower() in cell_text.lower():
+                            self.logger.debug(f"Found partial match for '{category_name}': '{cell_text}'")
+                            return True
+                except Exception as e:
+                    self.logger.debug(f"Error checking row: {e}")
+                    continue
+        
+            # If not found, try with a search if available
+            if not self.try_table_search(category_name):
+                self.logger.debug(f"Category '{category_name}' not found in table")
+        
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error in check_category_exists_by_row_scan: {e}")
+            return False
+    
     def close_item_categories_modal(self) -> bool:
         """Close the Item Categories modal"""
         try:
@@ -2050,13 +2272,13 @@ class MedicentreEnhancedImporter:
             return []
 
     def verify_imported_items(self, csv_items: List[Dict]) -> Dict:
-        """Verify which items from CSV were actually imported"""
+        """Verify which items from CSV were actually imported using Name and Batch No"""
         try:
             self.logger.info("=== Verifying imported items against inventory table ===")
         
             # Make sure we're on the inventory page
-            self.navigate_to_inventory_items()
-            time.sleep(2)
+            # self.navigate_to_inventory_items()
+            time.sleep(3)  # Give extra time for table to load
         
             # Get all items currently in the inventory table
             inventory_items = self.get_inventory_table_items()
@@ -2065,100 +2287,167 @@ class MedicentreEnhancedImporter:
             results = {
                 'imported_items': [],      # Items found in both CSV and inventory
                 'failed_items': [],        # Items in CSV but not in inventory
-                'skipped_items': [],       # Items that might have been skipped (optional)
+                'skipped_items': [],       # Items that might have been skipped
                 'imported_count': 0,
                 'failed_count': 0,
                 'skipped_count': 0,
-                'duplicate_items': [],     # Items that appear multiple times
+                'duplicate_items': [],     # Items that appear multiple times in CSV
+                'table_duplicates': [],    # Duplicate items found in inventory table
+                'partial_matches': [],     # Items with name match but batch mismatch
                 'verification_errors': []  # Any errors during verification
             }
         
-            # Create lookup dictionaries for faster searching
-            inventory_by_name = {item['name'].lower(): item for item in inventory_items if item['name']}
-            inventory_by_code = {item['code'].lower(): item for item in inventory_items if item['code']}
-            inventory_by_barcode = {item['barcode']: item for item in inventory_items if item['barcode']}
-        
-            # Track found items to identify duplicates
-            found_items = set()
-        
-            for csv_item in csv_items:
-                item_name = csv_item['name'].lower()
-                item_code = csv_item['item_code'].lower()
-                item_barcode = csv_item['barcode']
-            
-                # Try multiple matching strategies
-                matched = False
-            
-                # 1. Try by name
-                if item_name in inventory_by_name:
-                    matched_item = inventory_by_name[item_name]
-                    results['imported_items'].append({
-                        'csv_line': csv_item['line_number'],
-                        'csv_name': csv_item['name'],
-                        'inventory_name': matched_item['name'],
-                        'match_type': 'name',
-                        'item_code': csv_item['item_code']
-                    })
-                    results['imported_count'] += 1
-                    found_items.add(item_name)
-                    matched = True
-                
-                # 2. Try by item code (if not already matched)
-                elif not matched and item_code and item_code in inventory_by_code:
-                    matched_item = inventory_by_code[item_code]
-                    results['imported_items'].append({
-                        'csv_line': csv_item['line_number'],
-                        'csv_name': csv_item['name'],
-                        'inventory_name': matched_item['name'],
-                        'match_type': 'code',
-                        'item_code': csv_item['item_code']
-                    })
-                    results['imported_count'] += 1
-                    found_items.add(item_name)
-                    matched = True
-                
-                # 3. Try by barcode (if not already matched)
-                elif not matched and item_barcode and item_barcode in inventory_by_barcode:
-                    matched_item = inventory_by_barcode[item_barcode]
-                    results['imported_items'].append({
-                        'csv_line': csv_item['line_number'],
-                        'csv_name': csv_item['name'],
-                        'inventory_name': matched_item['name'],
-                        'match_type': 'barcode',
-                        'item_code': csv_item['item_code']
-                    })
-                    results['imported_count'] += 1
-                    found_items.add(item_name)
-                    matched = True
-                
-                # 4. Item not found
-                if not matched:
+            if not inventory_items:
+                self.logger.warning("No items found in inventory table - may be empty or table not loaded")
+                # All CSV items are considered failed
+                for csv_item in csv_items:
                     results['failed_items'].append({
                         'csv_line': csv_item['line_number'],
                         'csv_name': csv_item['name'],
-                        'item_code': csv_item['item_code'],
-                        'barcode': csv_item['barcode'],
-                        'reason': 'Not found in inventory table'
+                        'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
+                        'reason': 'Inventory table appears empty or not loaded'
+                    })
+                    results['failed_count'] += 1
+                return results
+        
+            # Create lookup dictionary: key = (name_lower, batch_lower)
+            inventory_lookup = {}
+            table_name_counts = {}  # Track duplicates in table
+
+            for inv_item in inventory_items:
+                name_key = inv_item['name'].lower()
+                batch_key = inv_item.get('batch', '').lower()
+            
+                # Create composite key
+                composite_key = f"{name_key}|{batch_key}"
+            
+                # Check for duplicates in table
+                if composite_key in inventory_lookup:
+                    if composite_key not in results['table_duplicates']:
+                        results['table_duplicates'].append({
+                            'name': inv_item['name'],
+                            'batch': inv_item.get('batch', ''),
+                            'count': 2  # Starting count
+                        })
+                    else:
+                        # Increment count for existing duplicate
+                        for dup in results['table_duplicates']:
+                            if dup['name'].lower() == name_key and dup['batch'].lower() == batch_key:
+                                dup['count'] += 1
+                                break
+                else:
+                    inventory_lookup[composite_key] = inv_item
+            
+                # Track name counts for duplicate detection
+                table_name_counts[name_key] = table_name_counts.get(name_key, 0) + 1
+
+            # Track found items to avoid double counting
+            found_composite_keys = set()
+        
+            # Check each CSV item against inventory
+            for csv_item in csv_items:
+                csv_name = csv_item['name'].lower()
+                csv_batch = csv_item.get('original_row', {}).get('Batch', '').lower()
+            
+                composite_key = f"{csv_name}|{csv_batch}"
+            
+                # Try exact match (name + batch)
+                if composite_key in inventory_lookup:
+                    inv_item = inventory_lookup[composite_key]
+                    results['imported_items'].append({
+                        'csv_line': csv_item['line_number'],
+                        'csv_name': csv_item['name'],
+                        'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
+                        'inventory_name': inv_item['name'],
+                        'inventory_batch': inv_item.get('batch', ''),
+                        'match_type': 'exact',
+                        'match_details': f"Name: '{csv_item['name']}', Batch: '{csv_item.get('original_row', {}).get('Batch', '')}'"
+                    })
+                    results['imported_count'] += 1
+                    found_composite_keys.add(composite_key)
+                
+                # Try name-only match (batch might be different or empty)
+                elif csv_name in [item['name'].lower() for item in inventory_items]:
+                    # Find all inventory items with this name
+                    matching_items = [item for item in inventory_items if item['name'].lower() == csv_name]
+                
+                    if len(matching_items) == 1:
+                        # Single match by name
+                        inv_item = matching_items[0]
+                        results['imported_items'].append({
+                            'csv_line': csv_item['line_number'],
+                            'csv_name': csv_item['name'],
+                            'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
+                            'inventory_name': inv_item['name'],
+                            'inventory_batch': inv_item.get('batch', ''),
+                            'match_type': 'name_only',
+                            'match_details': f"Name matched but batch differs: CSV='{csv_item.get('original_row', {}).get('Batch', '')}', Inventory='{inv_item.get('batch', '')}'",
+                            'warning': 'Batch number mismatch'
+                        })
+                        results['imported_count'] += 1
+                        found_composite_keys.add(f"{csv_name}|{inv_item.get('batch', '').lower()}")
+                    
+                    elif len(matching_items) > 1:
+                        # Multiple items with same name - partial match
+                        results['partial_matches'].append({
+                            'csv_line': csv_item['line_number'],
+                            'csv_name': csv_item['name'],
+                            'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
+                            'matching_inventory_items': [
+                                {'name': item['name'], 'batch': item.get('batch', '')} 
+                                for item in matching_items
+                            ],
+                            'match_type': 'multiple_name_matches'
+                        })
+                        # Count as imported but with warning
+                        results['imported_items'].append({
+                            'csv_line': csv_item['line_number'],
+                            'csv_name': csv_item['name'],
+                            'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
+                            'inventory_name': csv_item['name'],
+                            'inventory_batch': 'MULTIPLE',
+                            'match_type': 'multiple_name_matches',
+                            'match_details': f"Multiple inventory items with name '{csv_item['name']}'",
+                            'warning': 'Multiple items with same name found'
+                        })
+                        results['imported_count'] += 1
+                    
+                # Item not found at all
+                else:
+                    results['failed_items'].append({
+                        'csv_line': csv_item['line_number'],
+                        'csv_name': csv_item['name'],
+                        'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
+                        'reason': 'No matching item found in inventory table',
+                        'search_criteria': f"Name: '{csv_item['name']}', Batch: '{csv_item.get('original_row', {}).get('Batch', '')}'"
                     })
                     results['failed_count'] += 1
         
-            # Check for duplicates (items with same name in CSV)
-            name_counts = {}
+            # Check for duplicate items in CSV
+            csv_name_batch_counts = {}
             for csv_item in csv_items:
-                name = csv_item['name'].lower()
-                name_counts[name] = name_counts.get(name, 0) + 1
+                csv_name = csv_item['name'].lower()
+                csv_batch = csv_item.get('original_row', {}).get('Batch', '').lower()
+                key = f"{csv_name}|{csv_batch}"
+                csv_name_batch_counts[key] = csv_name_batch_counts.get(key, 0) + 1
         
-            for name, count in name_counts.items():
+            for key, count in csv_name_batch_counts.items():
                 if count > 1:
-                    duplicate_items = [item for item in csv_items if item['name'].lower() == name]
+                    name, batch = key.split('|')
+                    duplicate_items = [
+                        item for item in csv_items 
+                        if item['name'].lower() == name and 
+                        item.get('original_row', {}).get('Batch', '').lower() == batch
+                    ]
                     results['duplicate_items'].append({
                         'name': name,
+                        'batch': batch if batch else '(empty)',
                         'count': count,
                         'lines': [item['line_number'] for item in duplicate_items]
                     })
         
             self.logger.info(f"Verification complete: {results['imported_count']} imported, {results['failed_count']} failed")
-        
+
             return results
         
         except Exception as e:
@@ -2172,79 +2461,134 @@ class MedicentreEnhancedImporter:
                 'failed_count': len(csv_items),
                 'skipped_count': 0,
                 'duplicate_items': [],
+                'table_duplicates': [],
+                'partial_matches': [],
                 'verification_errors': [str(e)]
             }
-
+        
     def get_inventory_table_items(self) -> List[Dict]:
-        """Extract items from the inventory table"""
+        """Extract items from the inventory table with Name and Batch No columns"""
         items = []
         try:
-            view_inventory_button = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[@id='btnfilterproducts']")
-                )
-            )
-            view_inventory_button.click()
-
             # Wait for table to load
-            time.sleep(2)
+            time.sleep(3)
+
+            view_all_items_button = self.wait.until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@id='btnfilterproducts']"))
+            )
+            view_all_items_button.click()
+            time.sleep(3)
         
             # Try different table selectors
             table_selectors = [
                 "//table[@id='inventoryitemstable']",
-                "(//table[@id='inventoryitemstable'])[1]",
-                "#inventoryitemstable"
+                "#inventoryitemstable",
+                "(//table[@id='inventoryitemstable'])[1]"
             ]
         
             table = None
             for selector in table_selectors:
                 try:
                     table = self.driver.find_element(By.XPATH, selector)
+                    self.logger.info(f"Found inventory table with selector: {selector}")
                     break
                 except:
                     continue
         
             if not table:
-                self.logger.warning("Inventory table not found")
+                self.logger.warning("Inventory table not found with any selector")
+                # Take screenshot for debugging
+                self.take_screenshot("inventory_table_not_found")
                 return items
         
             # Get all rows (skip header if present)
-            rows = table.find_elements(By.XPATH, "//table[@id='inventoryitemstable']/tbody/tr")
-            if not rows:
+            rows = []
+            try:
+                rows = table.find_elements(By.XPATH, "//table[@id='inventoryitemstable']/tbody/tr")
+            except:
                 # Try without tbody
                 rows = table.find_elements(By.XPATH, ".//tr")
         
-            for row in rows:
+            if not rows:
+                self.logger.warning("No rows found in inventory table")
+                return items
+        
+            self.logger.info(f"Found {len(rows)} rows in inventory table")
+        
+            # Determine column indices by checking header
+            header_cells = []
+            try:
+                header_row = table.find_element(By.XPATH, ".//thead/tr") or table.find_element(By.XPATH, ".//tr[1]")
+                header_cells = header_row.find_elements(By.TAG_NAME, "th")
+                if not header_cells:
+                    header_cells = header_row.find_elements(By.TAG_NAME, "td")
+            except:
+                # If can't find header, assume standard order
+                pass
+        
+            # Log header for debugging
+            if header_cells:
+                headers = [cell.text.strip() for cell in header_cells]
+                self.logger.info(f"Table headers: {headers}")
+        
+            # Process each data row
+            for i, row in enumerate(rows):
                 try:
+                    # Skip if this looks like a header row
+                    if i == 0 and header_cells:
+                        continue
+                    
                     cells = row.find_elements(By.TAG_NAME, "td")
-                    if len(cells) >= 2:  # At least have name and code columns
-                        # Assuming column order: Name, Code, Barcode, ...
+                    if len(cells) >= 2:  # Need at least Name and Batch
+                        # Based on your columns: Name, Batch No, Unit Cost, Unit Price, Total Quantity, Available Quantity
                         item_name = cells[0].text.strip() if len(cells) > 0 else ""
-                        item_code = cells[1].text.strip() if len(cells) > 1 else ""
-                        item_barcode = cells[2].text.strip() if len(cells) > 2 else ""
+                        item_batch = cells[1].text.strip() if len(cells) > 1 else ""
+                        unit_cost = cells[2].text.strip() if len(cells) > 2 else ""
+                        unit_price = cells[3].text.strip() if len(cells) > 3 else ""
+                        total_qty = cells[4].text.strip() if len(cells) > 4 else ""
+                        available_qty = cells[5].text.strip() if len(cells) > 5 else ""
                     
                         if item_name:  # Only include items with names
                             items.append({
                                 'name': item_name,
-                                'code': item_code,
-                                'barcode': item_barcode,
-                                'row_data': [cell.text.strip() for cell in cells]
+                                'batch': item_batch,
+                                'unit_cost': unit_cost,
+                                'unit_price': unit_price,
+                                'total_quantity': total_qty,
+                                'available_quantity': available_qty,
+                                'row_index': i
                             })
+                        
+                            # Log first few items for verification
+                            if len(items) <= 5:
+                                self.logger.debug(f"Table item {len(items)}: Name='{item_name}', Batch='{item_batch}'")
+                    else:
+                        self.logger.debug(f"Row {i} has only {len(cells)} cells, skipping")
+                    
                 except Exception as e:
-                    self.logger.debug(f"Error processing table row: {e}")
+                    self.logger.debug(f"Error processing table row {i}: {e}")
                     continue
         
-            self.logger.info(f"Found {len(items)} items in inventory table")
-            return items
+            self.logger.info(f"Extracted {len(items)} items from inventory table")
         
+            # Log sample of extracted items
+            if items:
+                self.logger.info("Sample of extracted items (first 3):")
+                for i, item in enumerate(items[:3]):
+                    self.logger.info(f"  {i+1}. Name: '{item['name']}', Batch: '{item['batch']}'")
+        
+            return items
+
         except Exception as e:
             self.logger.error(f"Error reading inventory table: {e}")
+            self.take_screenshot("inventory_table_read_error")
             return []
 
+
     def log_import_verification_details(self, verification_result: Dict):
-        """Log detailed import verification results"""
+        """Log detailed import verification results with Name+Batch focus"""
         self.logger.info("\n" + "="*60)
-        self.logger.info("IMPORT VERIFICATION DETAILS")
+        self.logger.info("IMPORT VERIFICATION DETAILS (Name + Batch Matching)")
         self.logger.info("="*60)
     
         # Summary
@@ -2253,19 +2597,47 @@ class MedicentreEnhancedImporter:
         self.logger.info(f"  Failed to import: {verification_result['failed_count']}")
         self.logger.info(f"  Skipped: {verification_result['skipped_count']}")
     
-        # Imported items
+        if verification_result['imported_count'] + verification_result['failed_count'] > 0:
+            success_rate = (verification_result['imported_count'] / 
+                           (verification_result['imported_count'] + verification_result['failed_count'])) * 100
+            self.logger.info(f"  Success Rate: {success_rate:.1f}%")
+    
+        # Imported items with match types
         if verification_result['imported_items']:
             self.logger.info(f"\nIMPORTED ITEMS ({len(verification_result['imported_items'])}):")
-            for item in verification_result['imported_items'][:10]:  # Show first 10
-                self.logger.info(f"  ✓ Line {item['csv_line']}: '{item['csv_name']}' (matched by {item['match_type']})")
-            if len(verification_result['imported_items']) > 10:
-                self.logger.info(f"  ... and {len(verification_result['imported_items']) - 10} more")
+
+            # Group by match type
+            exact_matches = [item for item in verification_result['imported_items'] if item['match_type'] == 'exact']
+            name_only_matches = [item for item in verification_result['imported_items'] if item['match_type'] == 'name_only']
+            multiple_matches = [item for item in verification_result['imported_items'] if item['match_type'] == 'multiple_name_matches']
+        
+            if exact_matches:
+                self.logger.info(f"  Exact matches (Name + Batch): {len(exact_matches)}")
+                for item in exact_matches[:5]:
+                    self.logger.info(f"    ✓ Line {item['csv_line']}: '{item['csv_name']}' (Batch: '{item['csv_batch']}')")
+                if len(exact_matches) > 5:
+                    self.logger.info(f"    ... and {len(exact_matches) - 5} more exact matches")
+        
+            if name_only_matches:
+                self.logger.info(f"\n  Name-only matches (Batch differs): {len(name_only_matches)}")
+                for item in name_only_matches[:5]:
+                    self.logger.info(f"    ⚠ Line {item['csv_line']}: '{item['csv_name']}'")
+                    self.logger.info(f"      CSV Batch: '{item['csv_batch']}', Inventory Batch: '{item['inventory_batch']}'")
+                if len(name_only_matches) > 5:
+                    self.logger.info(f"    ... and {len(name_only_matches) - 5} more name-only matches")
+        
+            if multiple_matches:
+                self.logger.info(f"\n  Multiple matches (ambiguous): {len(multiple_matches)}")
+                for item in multiple_matches[:3]:
+                    self.logger.info(f"    ⚠ Line {item['csv_line']}: '{item['csv_name']}' matches multiple inventory items")
     
         # Failed items
         if verification_result['failed_items']:
             self.logger.info(f"\nFAILED ITEMS ({len(verification_result['failed_items'])}):")
-            for item in verification_result['failed_items'][:10]:  # Show first 10
-                self.logger.info(f"  ✗ Line {item['csv_line']}: '{item['csv_name']}' - {item['reason']}")
+            for item in verification_result['failed_items'][:10]:
+                batch_info = f", Batch: '{item['csv_batch']}'" if item['csv_batch'] else ""
+                self.logger.info(f"  ✗ Line {item['csv_line']}: '{item['csv_name']}'{batch_info}")
+                self.logger.info(f"    Reason: {item['reason']}")
             if len(verification_result['failed_items']) > 10:
                 self.logger.info(f"  ... and {len(verification_result['failed_items']) - 10} more")
     
@@ -2273,9 +2645,23 @@ class MedicentreEnhancedImporter:
         if verification_result['duplicate_items']:
             self.logger.info(f"\nDUPLICATE ITEMS IN CSV ({len(verification_result['duplicate_items'])}):")
             for dup in verification_result['duplicate_items']:
-                self.logger.info(f"  ⚠ '{dup['name']}' appears {dup['count']} times on lines: {dup['lines']}")
+                batch_info = f" (Batch: {dup['batch']})" if dup['batch'] != '(empty)' else ''
+                self.logger.info(f"  ⚠ '{dup['name']}'{batch_info} appears {dup['count']} times on lines: {dup['lines']}")
     
-        # Save detailed report to file
+        # Duplicate items in inventory table
+        if verification_result.get('table_duplicates'):
+            self.logger.info(f"\nDUPLICATE ITEMS IN INVENTORY TABLE ({len(verification_result['table_duplicates'])}):")
+            for dup in verification_result['table_duplicates'][:5]:
+                batch_info = f" (Batch: {dup['batch']})" if dup['batch'] else ''
+                self.logger.info(f"  ⚠ '{dup['name']}'{batch_info} appears {dup['count']} times in table")
+    
+        # Partial matches
+        if verification_result.get('partial_matches'):
+            self.logger.info(f"\nPARTIAL/AMBIGUOUS MATCHES ({len(verification_result['partial_matches'])}):")
+            for match in verification_result['partial_matches'][:3]:
+                self.logger.info(f"  ⚠ Line {match['csv_line']}: '{match['csv_name']}' could match multiple inventory items")
+    
+        # Save detailed report
         self.save_detailed_import_report(verification_result)
 
     def save_detailed_import_report(self, verification_result: Dict):
@@ -2614,82 +3000,129 @@ class MedicentreEnhancedImporter:
                 self.driver.quit()
                 self.logger.info("Browser session closed")
 
-
 def run_enhanced_importer():
     """Main function to run the enhanced importer"""
     print("=" * 60)
     print("MEDICENTRE v3 ENHANCED INVENTORY IMPORTER")
     print("=" * 60)
-
-    # Get configuration
+    
+    # Ask if user wants to use existing config or create new
     print("\n--- Configuration ---")
-    headless = input("Run in headless mode? (y/n): ").strip().lower() in ["y", "yes"]
-    storage_location = input("Storage Location (e.g., 'Main Store'): ").strip()
-    default_department = input(
-        "Default department for new categories (e.g., 'Pharmacy'): "
-    ).strip()
-
-    config = {
-        "headless": headless,
-        "storage_location": storage_location or "Main Store",
-        "default_department": default_department or "Pharmacy",
-    }
-
-    # Get credentials
-    print("\n--- Authentication ---")
-    base_url = input("Medicentre v3 URL: ").strip()
-    accesscode = input("Access Code: ").strip()
-    branch = input("Branch: ").strip()
-    username = input("Username: ").strip()
-    password = input("Password: ").strip()
-
+    use_existing = input("Load existing configuration? (y/n): ").strip().lower() in ["y", "yes"]
+    
+    config = None
+    if use_existing:
+        config_path = input("Config file path (press Enter for default): ").strip()
+        if config_path:
+            config = ConfigLoader.load_config(config_path)
+        else:
+            config = ConfigLoader.load_config()
+    else:
+        config = ConfigLoader.create_new_config(ConfigLoader.DEFAULT_CONFIG_PATH)
+    
+    if not config:
+        print("Failed to load/create configuration. Exiting.")
+        return
+    
+    # Validate essential configuration
+    required_fields = ['base_url', 'accesscode', 'branch', 'username', 'password']
+    missing_fields = [field for field in required_fields if not config.get(field)]
+    
+    if missing_fields:
+        print(f"\n✗ Missing required configuration fields: {missing_fields}")
+        print("Please create a new configuration with all required fields.")
+        return
+    
+    # Extract configuration into required format
     credentials = {
-        "accesscode": accesscode,
-        "branch": branch,
-        "username": username,
-        "password": password,
+        "accesscode": config.get("accesscode", ""),
+        "branch": config.get("branch", ""),
+        "username": config.get("username", ""),
+        "password": config.get("password", ""),
     }
-
+    
+    importer_config = {
+        "headless": config.get("headless", False),
+        "storage_location": config.get("storage_location", "Main Store"),
+        "default_department": config.get("default_department", "Pharmacy"),
+        "account_mappings": config.get("account_mappings", {}),
+        "vat_default_rate": config.get("vat_default_rate", 16),
+        "vat_default_tax_code": config.get("vat_default_tax_code", "E"),
+    }
+    
     # Get CSV path
     print("\n--- CSV File ---")
-    csv_path = input("Path to cleaned CSV file: ").strip()
-
-    if not Path(csv_path).exists():
-        print(f"✗ Error: File '{csv_path}' not found.")
+    default_csv = config.get("last_csv_path", "")
+    csv_path = input(f"Path to cleaned CSV file [{default_csv}]: ").strip()
+    if not csv_path:
+        csv_path = default_csv
+    
+    if not csv_path:
+        print("✗ Error: No CSV file specified.")
         return
-
+    
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        print(f"✗ Error: File '{csv_path}' not found.")
+        # Offer to browse
+        retry = input("Would you like to browse for the file? (y/n): ").strip().lower()
+        if retry in ['y', 'yes']:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            csv_path = filedialog.askopenfilename(title="Select CSV file", filetypes=[("CSV files", "*.csv")])
+            if not csv_path:
+                print("No file selected. Exiting.")
+                return
+        else:
+            return
+    
+    # Update last CSV path in config
+    config['last_csv_path'] = csv_path
+    ConfigLoader.save_config(config)
+    
     # Dry run option
     print("\n--- Execution Mode ---")
-    dry_run_input = (
-        input("Dry run (validate only, no changes)? (y/n): ").strip().lower()
-    )
+    dry_run_input = input("Dry run (validate only, no changes)? (y/n): ").strip().lower()
     dry_run = dry_run_input in ["y", "yes"]
-
+    
     if dry_run:
         print("\n⚠  DRY RUN MODE - No changes will be made to the system")
     else:
         print("\n⚠  LIVE MODE - Changes will be made to the system")
-
+    
     confirm = input("\nProceed with import? (y/n): ").strip().lower()
     if confirm not in ["y", "yes"]:
         print("Import cancelled.")
         return
-
+    
     # Create and run importer
     print("\n" + "=" * 60)
     print("STARTING IMPORT PROCESS")
     print("=" * 60)
-
-    importer = MedicentreEnhancedImporter(base_url, credentials, config, dry_run)
-    stats = importer.import_data(csv_path)
-
-    # Final message
-    print("\n" + "=" * 60)
-    print("PROCESS COMPLETE")
-    print("=" * 60)
-    print(f"Check the logs directory for detailed execution logs and screenshots.")
-    print(f"Check the reports directory for the import summary report.")
-    print("=" * 60)
+    
+    try:
+        importer = MedicentreV3InventoryImporter(
+            config.get("base_url", ""),
+            credentials,
+            importer_config,
+            dry_run
+        )
+        stats = importer.import_data(csv_path)
+        
+        # Final message
+        print("\n" + "=" * 60)
+        print("PROCESS COMPLETE")
+        print("=" * 60)
+        print(f"Configuration saved to: {ConfigLoader.DEFAULT_CONFIG_PATH}")
+        print(f"Check the logs directory for detailed execution logs and screenshots.")
+        print(f"Check the reports directory for the import summary report.")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\n✗ Error during import: {e}")
+        print("Check the logs for more details.")
 
 
 if __name__ == "__main__":
