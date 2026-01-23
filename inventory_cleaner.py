@@ -14,8 +14,8 @@ class InventoryDataCleaner:
     "tab": "Tablet", "tablet": "Tablet", "tabs": "Tablet", "tb": "Tablet",
     "tbs": "Tablet", "tbl": "Tablet", "tbt": "Tablet", "caplet": "Tablet",
     "caplets": "Tablet", "loz": "Lozenge", "lozenge": "Lozenge",
-    "troche": "Lozenge", "caps": "Capsule", "cp": "Capsule",
-    "capsule": "Capsule", "bottle": "Bottle", "bottles": "Bottle", 
+    "troche": "Lozenge", "caps": "Capsule", "cp": "Capsule", "capsules":"Capsule",
+    "capsule": "Capsule", "bottle": "Bottle", "bottles": "Bottle", "bottles":"Bottle",
     "btl": "Bottle", "vial": "Vial", "vials": "Vial", "amps": "Ampoule",
     "ampoule": "Ampoule", "ampul": "Ampoule", "ampule": "Ampoule",
     "ampules": "Ampoule", "sachet": "Sachet", "sachets": "Sachet",
@@ -26,7 +26,7 @@ class InventoryDataCleaner:
     "tin": "Tin", "can": "Can", "jar": "Jar", "tube": "Tube", "tubes": "Tube",
     "millilitre": "Ml", "mls": "Ml", "syrup": "Ml", "suspension": "Ml", 
     "susp": "Ml", "sol": "Ml", "solution": "Ml", "infusion": "Ml", 
-    "injection": "Ml", "cc": "Ml", "drop": "Drop", "drops": "Drop", 
+    "injection": "Ml", "cc": "Ml", "emulsion": "Ml", "drop": "Drop", "drops": "Drop", 
     "oint": "Ointment", "crm": "Tube", "cream": "Tube", "gel": "Tube", 
     "l": "Litre", "litre": "Litre", "liters": "Litre", "ltr": "Litre", 
     "lts": "Litre", "mgs": "Mg", "milligram": "Mg", "gram": "G", 
@@ -34,14 +34,14 @@ class InventoryDataCleaner:
     "kilogram": "Kg", "kilogrammes": "Kg", "pc": "Piece", "pcs": "Piece",
     "piece": "Piece", "pce": "Piece", "supp": "Suppository", 
     "supps": "Suppository", "supository": "Suppository", "pessary": "Pessary",
-    "ovule": "Pessary", "kit":"Kit"
+    "ovule": "Pessary", "kit":"Kit", "capsules": "Capsule", "tablets":"Tablet"
     }
     
     # List of canonical units in their correct Title Case form
     CANONICAL_UNITS = [
         'Tablet', 'Capsule', 'Bottle', 'Vial', 'Ampoule', 'Sachet', 'Strip',
         'Pack', 'Box', 'Tube', 'Ml', 'Mg', 'Litre', 'G', 'Kg', 'Unit', 'Jar',
-        'Lozenge', 'Piece', 'Pessary', 'Kit'
+        'Lozenge', 'Piece', 'Pessary', 'Kit', 'Suppository'
     ]
     
     REQUIRED_COLUMNS = [
@@ -630,10 +630,9 @@ class InventoryDataCleaner:
         4. Unit of measure normalization
         5. Intelligent sub-account normalization
         6. Default value application
-        7. Validation
+        7. Validation (numeric, dates)
         """
         cleaned_row = {}
-        
         try:
             # PHASE 1: TITLE CASE NORMALIZATION (First Step)
             # Apply Title Case to specified columns BEFORE any other processing
@@ -642,95 +641,117 @@ class InventoryDataCleaner:
                     cleaned_row[column] = self.apply_title_case(row[column], column)
                 else:
                     cleaned_row[column] = ''
-            
+        
             # Copy other columns as-is for now
             for column in ['Batch', 'ItemCode', 'Barcode', 'VATType', 'ExpiryDate']:
                 cleaned_row[column] = row.get(column, '')
-            
+        
             # PHASE 2: NAME CLEANING (After Title Case)
             cleaned_row['Name'] = self.clean_name(cleaned_row['Name'])
-            
+
             # PHASE 3: DE-DUPLICATION CHECK (Immediately after Name cleaning)
             # Check for duplicate names BEFORE any further processing
             is_duplicate, retained_row = self.check_duplicate_name(cleaned_row['Name'], row_index)
-            
+
             if is_duplicate:
                 # This is a duplicate - log and skip processing
                 self.report['duplicates_removed'].append(
                     f"Row {row_index} skipped: Duplicate Name '{cleaned_row['Name']}' (already processed in Row {retained_row})"
                 )
                 return None  # Skip this row entirely
-            
+        
             # Not a duplicate - add normalized name to tracking set
             normalized_name = self.normalize_name_key(cleaned_row['Name'])
             self.seen_names.add(normalized_name)
-            
+        
             # PHASE 4: UNIT OF MEASURE NORMALIZATION (After Title Case and de-duplication)
             # Note: UnitOfMeasure already has Title Case applied
             original_unit = cleaned_row['UnitOfMeasure']
             cleaned_row['UnitOfMeasure'] = self.normalize_unit_of_measure(
                 original_unit, cleaned_row['Name'], row_index
             )
-            
+        
             # PHASE 5: INTELLIGENT SUB-ACCOUNT NORMALIZATION (After Title Case)
             # Note: Sub-account fields already have Title Case applied
             cleaned_row = self.handle_empty_sub_accounts(cleaned_row, row_index)
-            
+        
             # PHASE 6: DEFAULT VALUE APPLICATION
             # Handle VAT Type
             cleaned_row['VATType'] = self.clean_vat_type(cleaned_row['VATType'], row_index)
-            
+        
             # Handle Item Class
             if not cleaned_row['ItemClass'] or cleaned_row['ItemClass'].strip() == '':
                 cleaned_row['ItemClass'] = self.user_defaults['default_item_class']
                 self.report['defaults_used'].append(
                     f"Row {row_index}: Empty ItemClass replaced with default '{self.user_defaults['default_item_class']}'"
                 )
-            
+        
             # Handle Item Category
             if not cleaned_row['ItemCategory'] or cleaned_row['ItemCategory'].strip() == '':
                 cleaned_row['ItemCategory'] = self.user_defaults['default_item_category']
                 self.report['defaults_used'].append(
                     f"Row {row_index}: Empty ItemCategory replaced with default '{self.user_defaults['default_item_category']}'"
                 )
-            
+        
             # PHASE 7: VALIDATION
             # Numeric fields
             unit_cost, valid = self.validate_numeric(row.get('UnitCost', ''), 'UnitCost', row_index)
             if not valid:
-                return None
+                return None  # Numeric validation failures are critical - skip row
             cleaned_row['UnitCost'] = unit_cost or 0.0
-            
+        
             total_qty, valid = self.validate_numeric(row.get('TotalQuantity', ''), 'TotalQuantity', row_index)
             if not valid:
-                return None
+                return None  # Numeric validation failures are critical - skip row
             cleaned_row['TotalQuantity'] = total_qty or 0
-            
+        
             unit_price, valid = self.validate_numeric(row.get('UnitPrice', ''), 'UnitPrice', row_index)
             if not valid:
-                return None
+                return None  # Numeric validation failures are critical - skip row
             cleaned_row['UnitPrice'] = unit_price or 0.0
-            
+        
             # Handle ReorderLevel with default
             cleaned_row['ReorderLevel'] = self.handle_reorder_level(
                 row.get('ReorderLevel', ''), row_index
             )
-            
-            # Handle Expiry Date
+        
+            # Handle Expiry Date - FIXED: Don't skip entire row on invalid date format
             expiry_date, valid = self.handle_expiry_date(
                 cleaned_row.get('ExpiryDate', ''), row_index
             )
             if not valid:
-                return None
+                # Instead of skipping row, use default expiry date
+                try:
+                    default_dt = datetime.strptime(self.user_defaults['default_expiry_date'], '%d/%m/%Y')
+                    if default_dt > datetime.now():
+                        expiry_date = self.user_defaults['default_expiry_date']
+                        self.report['defaults_used'].append(
+                            f"Row {row_index}: Invalid expiry date format replaced with default '{expiry_date}'"
+                        )
+                    else:
+                        # Compute future date (1 year from today)
+                        future_date = (datetime.now() + timedelta(days=365)).strftime('%d/%m/%Y')
+                        expiry_date = future_date
+                        self.report['defaults_used'].append(
+                            f"Row {row_index}: Invalid expiry date format replaced with computed future date '{expiry_date}'"
+                        )
+                except ValueError:
+                    # Even default is invalid, compute future date
+                    future_date = (datetime.now() + timedelta(days=365)).strftime('%d/%m/%Y')
+                    expiry_date = future_date
+                    self.report['defaults_used'].append(
+                        f"Row {row_index}: Invalid expiry date format replaced with computed future date '{expiry_date}'"
+                    )
+        
             cleaned_row['ExpiryDate'] = expiry_date
-            
+        
             # Copy remaining fields
             cleaned_row['Batch'] = cleaned_row.get('Batch', '').strip()
             cleaned_row['ItemCode'] = str(cleaned_row.get('ItemCode', '')).strip()
             cleaned_row['Barcode'] = str(cleaned_row.get('Barcode', '')).strip()
-            
+
             return cleaned_row
-            
+
         except Exception as e:
             self.report['errors'].append(f"Row {row_index}: Error cleaning row - {str(e)}")
             import traceback
@@ -744,7 +765,8 @@ class InventoryDataCleaner:
             self.validate_defaults()
             
             # Read input CSV
-            with open(self.csv_path, 'r', encoding='utf-8') as f:
+            # with open(self.csv_path, 'r', encoding='utf-8') as f:
+            with open(self.csv_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 
                 # Validate required columns
@@ -756,11 +778,19 @@ class InventoryDataCleaner:
                 self.seen_names.clear()
                 
                 # Process each row with strict ordering
+                rows_processed = 0
                 for i, row in enumerate(reader, 1):
+                    # Skip empty rows (all values are empty or whitespace)
+                    if all(str(value).strip() == '' for value in row.values()):
+                        continue # Skip completely empty rows    
                     cleaned = self.clean_row(row, i)
                     if cleaned:
                         self.cleaned_data.append(cleaned)
-            
+                    rows_processed += 1
+
+                print(f"Total non-empty rows processed: {rows_processed}")
+                print(f"Rows successfully cleaned: {len(self.cleaned_data)}")
+
             # Generate output filename
             input_path = Path(self.csv_path)
             output_path = input_path.parent / f"{input_path.stem}_cleaned{input_path.suffix}"
@@ -902,8 +932,11 @@ class InventoryDataCleaner:
             f.write("-" * 80 + "\n")
             f.write(f"Unique products after de-duplication: {len(self.cleaned_data)}\n")
             f.write(f"Duplicate products removed: {len(self.report['duplicates_removed'])}\n")
-            f.write(f"De-duplication efficiency: {len(self.report['duplicates_removed'])/total_rows*100:.1f}%\n")
-            
+            if total_rows > 0:
+                f.write(f"De-duplication efficiency: {len(self.report['duplicates_removed'])/total_rows*100:.1f}%\n")
+            else:
+                f.write(f"De-duplication efficiency: N/A (no rows processed)\n")
+
             f.write("\n" + "=" * 80 + "\n")
             f.write("END OF REPORT\n")
 
