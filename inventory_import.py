@@ -225,36 +225,6 @@ class MedicentreV3InventoryImporter:
                 self.driver = None
             return self.login()
 
-    # def navigate_to_module(self, module_path: List[str]) -> bool:
-    #     """Navigate through menu hierarchy to target module"""
-    #     try:
-    #         if not self.check_session():
-    #             return False
-
-    #         self.logger.info(f"Navigating to: {' → '.join(module_path)}")
-
-    #         # Handle specific navigation based on target module
-    #         if module_path == ["Inventory", "Inventory"]:
-    #             return self.navigate_to_inventory_items()
-    #         elif module_path == ["Inventory", "Inventory Setup", "Item Categories"]:
-    #             return self.navigate_to_item_categories()
-    #         elif module_path == ["Inventory", "Inventory Setup", "Item Classes"]:
-    #             return self.navigate_to_item_classes()
-    #         elif module_path == ["Inventory", "Unit of Measure"]:
-    #             return self.navigate_to_unit_of_measure()
-    #         elif module_path == ["Accounts", "Chart of Accounts"]:
-    #             return self.navigate_to_chart_of_accounts()
-    #         elif module_path == ["Accounts", "Taxes"]:
-    #             return self.navigate_to_taxes()
-    #         else:
-    #             self.logger.error(f"Unknown module path: {module_path}")
-    #             return False
-
-    #     except Exception as e:
-    #         self.logger.error(f"✗ Navigation failed to {module_path}: {str(e)}")
-    #         self.take_screenshot(f"navigation_error_{'_'.join(module_path)}")
-    #         return False
-
     # ==================== CHART OF ACCOUNTS PANEL ====================
 
     def navigate_to_chart_of_accounts(self) -> bool:
@@ -1637,7 +1607,7 @@ class MedicentreV3InventoryImporter:
                 )
             )
             item_categories_button.click()
-            time.sleep(3)  # Wait for modal to fully load
+            time.sleep(3)  # Wait for modal to fully load  
 
             self.logger.info("✓ Successfully navigated to Item Categories modal")
             return True
