@@ -3,8 +3,13 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import os
+from dotenv import load_dotenv
 from typing import Dict, List, Tuple, Optional, Any, Set
 from difflib import SequenceMatcher  # For similarity comparison
+
+# Load environment variables from .env file
+load_dotenv()
 
 class InventoryDataCleaner:
     """Cleans and standardizes inventory data for Medicentre v3"""
@@ -15,7 +20,7 @@ class InventoryDataCleaner:
     "tbs": "Tablet", "tbl": "Tablet", "tbt": "Tablet", "caplet": "Tablet",
     "caplets": "Tablet", "loz": "Lozenge", "lozenge": "Lozenge",
     "troche": "Lozenge", "caps": "Capsule", "cp": "Capsule", "capsules":"Capsule",
-    "capsule": "Capsule", "bottle": "Bottle", "bottles": "Bottle", "bottles":"Bottle",
+    "capsule": "Capsule", "bottle": "Bottle", "bottles": "Bottle",
     "btl": "Bottle", "vial": "Vial", "vials": "Vial", "amps": "Ampoule",
     "ampoule": "Ampoule", "ampul": "Ampoule", "ampule": "Ampoule",
     "ampules": "Ampoule", "sachet": "Sachet", "sachets": "Sachet",
@@ -93,6 +98,7 @@ class InventoryDataCleaner:
         self.user_defaults.setdefault('default_revenue_account', 'Sales - Pharmacy Drugs')
         self.user_defaults.setdefault('default_cost_account', 'Cost Of Goods Sold - Pharmacy Drugs')
     
+
     def validate_defaults(self):
         """Validate user-provided defaults"""
         # Validate expiry date format and future date
@@ -269,6 +275,10 @@ class InventoryDataCleaner:
         if not normalized_name:
             return False, None  # Empty names are not considered duplicates
         
+        # Don't track placeholder names for de-duplication
+        if cleaned_name.startswith("EMPTY_NAME_ROW_"):
+            return False, None
+        
         # Check if we've seen this normalized name before
         if normalized_name in self.seen_names:
             # Find which row originally had this name
@@ -339,6 +349,16 @@ class InventoryDataCleaner:
         if unit_lower in self.unit_resolutions:
             return self.unit_resolutions[unit_lower]
         
+        # Remove spaces and check again
+        unit_no_spaces = unit.replace(' ', '').lower()
+        if unit_no_spaces in self.UNIT_MAPPING:
+            normalized = self.UNIT_MAPPING[unit_no_spaces]
+            if unit != normalized:
+                self.report['normalizations'].append(
+                    f"Row {row_index}: Unit normalized (spaces removed) '{unit}' → '{normalized}'"
+                )
+            return normalized
+        
         # Check mapping (case-insensitive)
         if unit_lower in self.UNIT_MAPPING:
             normalized = self.UNIT_MAPPING[unit_lower]
@@ -347,6 +367,30 @@ class InventoryDataCleaner:
                     f"Row {row_index}: Unit normalized '{unit}' → '{normalized}'"
                 )
             return normalized
+    
+        # Check for partial matches in mapping keys
+        # This handles cases like "TAB S" where there's an extra space
+        for mapped_key, mapped_value in self.UNIT_MAPPING.items():
+            # Remove spaces from both for comparison
+            if unit_no_spaces == mapped_key.replace(' ', ''):
+                normalized = mapped_value
+                if unit != normalized:
+                    self.report['normalizations'].append(
+                        f"Row {row_index}: Unit normalized (partial match) '{unit}' → '{normalized}'"
+                    )
+                return normalized
+        
+        # Check if unit starts with any known unit abbreviation
+        # This handles cases like "TAB S" where "S" might be extra
+        for mapped_key, mapped_value in self.UNIT_MAPPING.items():
+            # Check if the unit (with spaces removed) starts with the mapped key
+            if unit_no_spaces.startswith(mapped_key.replace(' ', '')):
+                normalized = mapped_value
+                if unit != normalized:
+                    self.report['normalizations'].append(
+                        f"Row {row_index}: Unit normalized (starts with) '{unit}' → '{normalized}'"
+                    )
+                return normalized
         
         # Check if unit is singular/plural variation of canonical unit
         # This handles cases like 'Tablets' (plural) when canonical is 'Tablet' (singular)
@@ -354,7 +398,10 @@ class InventoryDataCleaner:
             canonical_lower = canonical.lower()
             # Check for exact match after removing common plural suffixes
             unit_singular = self._make_singular(unit_lower)
-            if unit_singular == canonical_lower:
+            # Also check without spaces
+            unit_no_spaces_singular = self._make_singular(unit_no_spaces)
+
+            if unit_singular == canonical_lower or unit_no_spaces_singular == canonical_lower:
                 self.report['normalizations'].append(
                     f"Row {row_index}: Unit '{unit}' recognized as plural of '{canonical}'"
                 )
@@ -509,14 +556,32 @@ class InventoryDataCleaner:
             str_value = str(value).strip()
             # Remove any currency symbols, commas, or extra spaces
             cleaned = re.sub(r'[^\d.-]', '', str_value)
+
+            if not cleaned:  # If nothing left after cleaning
+                self.report['warnings'].append(f"Row {row_index}: {field_name} is empty after cleaning")
+                return None, True
+            
+            num_value = float(cleaned)
+
+            # Check for negative values
+            if num_value < 0:
+                self.report['errors'].append(
+                    f"Row {row_index}: {field_name} has negative value '{value}' - using 0 instead"
+                )
+                num_value = 0.0  # Set to 0 for negative values
             
             if field_name in ['UnitCost', 'UnitPrice']:
-                num_value = float(cleaned)
-                # Round to 2 decimal places for currency
-                return round(num_value, 2), True
+                # Ensure exactly 2 decimal places for currency
+                formatted_value = round(num_value, 2)
+                # Check if rounding changed the value
+                if abs(formatted_value - num_value) > 0.0001:  # Small tolerance
+                    self.report['normalizations'].append(
+                        f"Row {row_index}: {field_name} '{value}' rounded to 2 decimal places '{formatted_value:.2f}'"
+                    )
+                # ALWAYS return formatted_value, not just when rounding changes it
+                return formatted_value, True
             else:  # TotalQuantity, ReorderLevel
-                # Handle decimal values by truncating (not rounding)
-                num_value = float(cleaned)
+                # Convert to integer (whole number)
                 int_value = int(num_value)
                 if int_value != num_value:
                     self.report['normalizations'].append(
@@ -551,13 +616,15 @@ class InventoryDataCleaner:
             )
             return int(self.user_defaults['default_reorder_level'])
         
-        # Ensure positive integer
+        # Ensure positive integer (negative values already handled in validate_numeric)
         reorder_int = int(validated)
+        
+        # Double-check for negative (though validate_numeric should have caught it)
         if reorder_int < 0:
-            self.report['warnings'].append(
-                f"Row {row_index}: Negative ReorderLevel {reorder_int} replaced with default"
+            self.report['errors'].append(
+                f"Row {row_index}: ReorderLevel {reorder_int} is negative - using 0"
             )
-            return int(self.user_defaults['default_reorder_level'])
+            return 0
         
         return reorder_int
     
@@ -645,24 +712,33 @@ class InventoryDataCleaner:
             # Copy other columns as-is for now
             for column in ['Batch', 'ItemCode', 'Barcode', 'VATType', 'ExpiryDate']:
                 cleaned_row[column] = row.get(column, '')
+            
+            # CHECK FOR EMPTY NAME - Log error but continue processing
+            if not cleaned_row['Name'] or cleaned_row['Name'].strip() == '':
+                self.report['errors'].append(f"Row {row_index}: Name column is empty - using placeholder")
+                
+                # Use a placeholder name so the row can be processed
+                cleaned_row['Name'] = f"EMPTY_NAME_ROW_{row_index}"
         
             # PHASE 2: NAME CLEANING (After Title Case)
             cleaned_row['Name'] = self.clean_name(cleaned_row['Name'])
 
             # PHASE 3: DE-DUPLICATION CHECK (Immediately after Name cleaning)
             # Check for duplicate names BEFORE any further processing
-            is_duplicate, retained_row = self.check_duplicate_name(cleaned_row['Name'], row_index)
+            # Skip de-duplication for placeholder names (empty names)
+            if not cleaned_row['Name'].startswith("EMPTY_NAME_ROW_"):
+                is_duplicate, retained_row = self.check_duplicate_name(cleaned_row['Name'], row_index)
 
-            if is_duplicate:
-                # This is a duplicate - log and skip processing
-                self.report['duplicates_removed'].append(
-                    f"Row {row_index} skipped: Duplicate Name '{cleaned_row['Name']}' (already processed in Row {retained_row})"
-                )
-                return None  # Skip this row entirely
-        
-            # Not a duplicate - add normalized name to tracking set
-            normalized_name = self.normalize_name_key(cleaned_row['Name'])
-            self.seen_names.add(normalized_name)
+                if is_duplicate:
+                    # This is a duplicate - log and skip processing
+                    self.report['duplicates_removed'].append(
+                        f"Row {row_index} skipped: Duplicate Name '{cleaned_row['Name']}' (already processed in Row {retained_row})"
+                    )
+                    return None  # Skip this row entirely
+                else:
+                    # Not a duplicate - add normalized name to tracking set
+                    normalized_name = self.normalize_name_key(cleaned_row['Name'])
+                    self.seen_names.add(normalized_name)
         
             # PHASE 4: UNIT OF MEASURE NORMALIZATION (After Title Case and de-duplication)
             # Note: UnitOfMeasure already has Title Case applied
@@ -697,24 +773,27 @@ class InventoryDataCleaner:
             # Numeric fields
             unit_cost, valid = self.validate_numeric(row.get('UnitCost', ''), 'UnitCost', row_index)
             if not valid:
-                return None  # Numeric validation failures are critical - skip row
+                unit_cost = 0.0 # Default to 0 if invalid
+                self.report['errors'].append(f"Row {row_index}: Invalid UnitCost - using 0.00")
             cleaned_row['UnitCost'] = unit_cost or 0.0
         
             total_qty, valid = self.validate_numeric(row.get('TotalQuantity', ''), 'TotalQuantity', row_index)
             if not valid:
-                return None  # Numeric validation failures are critical - skip row
+                total_qty = 0 # Default to 0 if invalid
+                self.report['errors'].append(f"Row {row_index}: Invalid TotalQuantity - using 0")
             cleaned_row['TotalQuantity'] = total_qty or 0
         
             unit_price, valid = self.validate_numeric(row.get('UnitPrice', ''), 'UnitPrice', row_index)
             if not valid:
-                return None  # Numeric validation failures are critical - skip row
+                unit_price = 0.0  # Default to 0 if invalid
+                self.report['errors'].append(f"Row {row_index}: Invalid UnitPrice - using 0.00")
             cleaned_row['UnitPrice'] = unit_price or 0.0
         
             # Handle ReorderLevel with default
             cleaned_row['ReorderLevel'] = self.handle_reorder_level(
                 row.get('ReorderLevel', ''), row_index
             )
-        
+
             # Handle Expiry Date - FIXED: Don't skip entire row on invalid date format
             expiry_date, valid = self.handle_expiry_date(
                 cleaned_row.get('ExpiryDate', ''), row_index
@@ -757,7 +836,7 @@ class InventoryDataCleaner:
             import traceback
             self.report['errors'].append(f"Row {row_index}: Traceback - {traceback.format_exc()}")
             return None
-    
+
     def process(self) -> Tuple[bool, str]:
         """Main processing method"""
         try:
@@ -871,6 +950,15 @@ class InventoryDataCleaner:
                 f.write("No user interventions were required.\n")
             f.write("\n")
             
+            f.write("EMPTY NAME ERRORS:\n")
+            f.write("-" * 80 + "\n")
+            empty_name_errors = [e for e in self.report['errors'] if 'Name column is empty' in e]
+            for item in empty_name_errors:
+                f.write(f"⚠ {item}\n")
+            if not empty_name_errors:
+                f.write("No empty name errors.\n")
+            f.write("\n")
+
             f.write("UNIT OF MEASURE RESOLUTIONS:\n")
             f.write("-" * 80 + "\n")
             for unit, resolution in self.unit_resolutions.items():
@@ -909,6 +997,32 @@ class InventoryDataCleaner:
                 f.write("No errors.\n")
             
             f.write("\n" + "=" * 80 + "\n")
+            f.write("NUMERIC VALIDATION SUMMARY:\n")
+            f.write("-" * 80 + "\n")
+            
+            # Count negative value corrections
+            negative_corrections = [e for e in self.report['errors'] if 'has negative value' in e]
+            f.write(f"Negative values corrected: {len(negative_corrections)}\n")
+            
+            # Count decimal normalizations
+            decimal_norms = [n for n in self.report['normalizations'] if 'rounded to 2 decimal places' in n]
+            f.write(f"Decimal values normalized: {len(decimal_norms)}\n")
+            
+            # Count integer conversions
+            int_conversions = [n for n in self.report['normalizations'] if 'converted to integer' in n]
+            f.write(f"Values converted to integers: {len(int_conversions)}\n")
+            
+            # List some examples if any
+            if negative_corrections:
+                f.write("\nExamples of negative value corrections:\n")
+                for i, error in enumerate(negative_corrections[:5]):  # Show first 5
+                    f.write(f"  {i+1}. {error}\n")
+                if len(negative_corrections) > 5:
+                    f.write(f"  ... and {len(negative_corrections) - 5} more\n")
+            
+            f.write("\n")
+
+            f.write("\n" + "=" * 80 + "\n")
             f.write("CLEANING STATISTICS:\n")
             f.write("-" * 80 + "\n")
             total_rows = len(self.cleaned_data) + len([e for e in self.report['errors'] if 'Row' in e]) + len(self.report['duplicates_removed'])
@@ -921,6 +1035,11 @@ class InventoryDataCleaner:
             f.write(f"User decisions: {len(self.report['user_decisions'])}\n")
             f.write(f"Warnings: {len(self.report['warnings'])}\n")
             f.write(f"Errors: {len(self.report['errors'])}\n")
+
+            # Numeric validation stats
+            f.write(f"Negative values corrected: {len(negative_corrections)}\n")
+            f.write(f"Decimal normalizations: {len(decimal_norms)}\n")
+            f.write(f"Integer conversions: {len(int_conversions)}\n")
             
             # Sub-account statistics
             sub_account_norms = [n for n in self.report['normalizations'] if 'SubAccount' in n]
@@ -954,29 +1073,63 @@ def run_data_cleaner():
     print("6. Default value application")
     print("7. Validation (numeric, dates)\n")
     
-    # Get input file
-    csv_path = input("Enter path to CSV file: ").strip()
-    if not Path(csv_path).exists():
-        print(f"Error: File '{csv_path}' not found.")
+    # Get input file from .env - REQUIRED
+    csv_path = os.getenv('INPUT_CSV_PATH', '')
+    if not csv_path:
+        print("ERROR: INPUT_CSV_PATH not found in .env file")
+        print("Please add INPUT_CSV_PATH=/path/to/your/file.csv to your .env file")
         return
     
-    # Get user defaults
-    print("\n" + "="*60)
-    print("ENTER DEFAULTS FOR MISSING VALUES")
-    print("="*60)
-    print("IMPORTANT: Sub-account defaults will be used as authoritative references.")
-    print("Variations similar to these defaults will be normalized to exact matches.\n")
+    if not Path(csv_path).exists():
+        print(f"ERROR: File '{csv_path}' not found.")
+        print(f"Please check INPUT_CSV_PATH in .env file")
+        return
     
+    # Get all other defaults from .env - REQUIRED
+    print("\n" + "="*60)
+    print("LOADING CONFIGURATION FROM .ENV FILE")
+    print("="*60)
+
+    # List of required environment variables with descriptions
+    required_env_vars = {
+        'DEFAULT_VAT_TYPE': "Default VAT Type (e.g., 'VAT Exempt')",
+        'DEFAULT_ITEM_CLASS': "Default Item Class (e.g., 'Product')",
+        'DEFAULT_ITEM_CATEGORY': "Default Item Category (e.g., 'Pharmacy Drugs')",
+        'DEFAULT_UNIT_OF_MEASURE': "Default Unit of Measure (e.g., 'Tablet')",
+        'DEFAULT_EXPIRY_DATE': "Default Expiry Date (dd/mm/yyyy)",
+        'DEFAULT_REORDER_LEVEL': "Default Reorder Level (integer, e.g., 10)",
+        'DEFAULT_ASSET_ACCOUNT': "Default Asset Sub-Account (e.g., 'Inventory - Pharmacy Drugs')",
+        'DEFAULT_REVENUE_ACCOUNT': "Default Revenue Sub-Account (e.g., 'Sales - Pharmacy Drugs')",
+        'DEFAULT_COST_ACCOUNT': "Default Cost of Sale Sub-Account (e.g., 'Cost Of Goods Sold - Pharmacy Drugs')"
+    }
+
+    # Check all required variables exist
+    missing_vars = []
+    for env_var, description in required_env_vars.items():
+        value = os.getenv(env_var, '')
+        if not value:
+            missing_vars.append((env_var, description))
+        else:
+            print(f"✓ Loaded {description}: {value}")
+    
+    if missing_vars:
+        print("\nERROR: Missing required configuration in .env file:")
+        for env_var, description in missing_vars:
+            print(f"  - {env_var}: {description}")
+        print("\nPlease add these to your .env file and try again.")
+        return
+    
+    # Build user_defaults dictionary from .env
     user_defaults = {
-        'default_vat_type': input("Default VAT Type (e.g., 'VAT Exempt'): ").strip(),
-        'default_item_class': input("Default Item Class (e.g., 'Product'): ").strip(),
-        'default_item_category': input("Default Item Category (e.g., 'Pharmacy Drugs'): ").strip(),
-        'default_unit_of_measure': input("Default Unit of Measure (e.g., 'Pack'): ").strip(),
-        'default_expiry_date': input("Default Expiry Date (dd/mm/yyyy): ").strip(),
-        'default_reorder_level': input("Default Reorder Level (integer, e.g., 10): ").strip() or '10',
-        'default_asset_account': input("Default Asset Sub-Account (e.g., 'Inventory - Pharmacy Drugs'): ").strip() or 'Inventory - Pharmacy Drugs',
-        'default_revenue_account': input("Default Revenue Sub-Account (e.g., 'Sales - Pharmacy Drugs'): ").strip() or 'Sales - Pharmacy Drugs',
-        'default_cost_account': input("Default Cost of Sale Sub-Account (e.g., 'Cost Of Goods Sold - Pharmacy Drugs'): ").strip() or 'Cost Of Goods Sold - Pharmacy Drugs'
+        'default_vat_type': os.getenv('DEFAULT_VAT_TYPE'),
+        'default_item_class': os.getenv('DEFAULT_ITEM_CLASS'),
+        'default_item_category': os.getenv('DEFAULT_ITEM_CATEGORY'),
+        'default_unit_of_measure': os.getenv('DEFAULT_UNIT_OF_MEASURE'),
+        'default_expiry_date': os.getenv('DEFAULT_EXPIRY_DATE'),
+        'default_reorder_level': int(os.getenv('DEFAULT_REORDER_LEVEL')),
+        'default_asset_account': os.getenv('DEFAULT_ASSET_ACCOUNT'),
+        'default_revenue_account': os.getenv('DEFAULT_REVENUE_ACCOUNT'),
+        'default_cost_account': os.getenv('DEFAULT_COST_ACCOUNT')
     }
     
     print("\n" + "="*60)
@@ -994,6 +1147,25 @@ def run_data_cleaner():
     success, result = cleaner.process()
     
     if success:
+       # Save output path to .env for next script
+        env_file_path = Path('.env')
+        if env_file_path.exists():
+            with open(env_file_path, 'r') as f:
+                env_lines = f.readlines()
+            
+            updated = False
+            for i, line in enumerate(env_lines):
+                if line.startswith('OUTPUT_CLEANED_PATH='):
+                    env_lines[i] = f'OUTPUT_CLEANED_PATH={result}\n'
+                    updated = True
+                    break
+            
+            if not updated:
+                env_lines.append(f'\nOUTPUT_CLEANED_PATH={result}\n')
+            
+            with open(env_file_path, 'w') as f:
+                f.writelines(env_lines)
+
         print(f"\n" + "="*60)
         print("✓ CLEANUP COMPLETED SUCCESSFULLY!")
         print("="*60)
