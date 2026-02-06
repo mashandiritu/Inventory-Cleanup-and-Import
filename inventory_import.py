@@ -12,15 +12,60 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (NoSuchElementException)
 from datetime import datetime
-from config_loader import ConfigLoader
-import json
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+
+
+class ConfigLoader:
+    """Load configuration from environment variables"""
+    
+    @staticmethod
+    def load_config() -> Dict:
+        """Load configuration from environment variables"""
+        config = {
+            'base_url': os.getenv('MEDICENTRE_BASE_URL', ''),
+            'accesscode': os.getenv('MEDICENTRE_ACCESSCODE', ''),
+            'branch': os.getenv('MEDICENTRE_BRANCH', ''),
+            'username': os.getenv('MEDICENTRE_USERNAME', ''),
+            'password': os.getenv('MEDICENTRE_PASSWORD', ''),
+            'headless': os.getenv('HEADLESS_MODE', 'false').lower() == 'true',
+            'storage_location': os.getenv('STORAGE_LOCATION', 'Main Pharmacy'),
+            'default_department': os.getenv('DEFAULT_DEPARTMENT', 'Pharmacy'),
+            'enable_screenshots': os.getenv('ENABLE_SCREENSHOTS', 'true').lower() == 'true',
+            'screenshot_dir': os.getenv('SCREENSHOT_DIR', 'logs/screenshots'),
+            'log_dir': os.getenv('LOG_DIR', 'logs'),
+            'default_timeout': int(os.getenv('DEFAULT_TIMEOUT', '30')),
+            'account_mappings': {
+                'inventory_main': os.getenv('INVENTORY_MAIN_ACCOUNT', 'Inventory'),
+                'inventory_class': os.getenv('INVENTORY_CLASS', 'Current Assets'),
+                'revenue_main': os.getenv('REVENUE_MAIN_ACCOUNT', 'Revenue'),
+                'revenue_class': os.getenv('REVENUE_CLASS', 'Income'),
+                'cost_main': os.getenv('COST_MAIN_ACCOUNT', 'Cost of Goods Sold'),
+                'cost_class': os.getenv('COST_CLASS', 'Cost of Goods Sold')
+            },
+            'vat_default_rate': int(os.getenv('VAT_DEFAULT_RATE', '0')),
+            'vat_default_tax_code': os.getenv('VAT_DEFAULT_TAX_CODE', 'A'),
+            'last_csv_path': os.getenv('OUTPUT_CLEANED_PATH', '')
+        }
+        return config
+    
+    @staticmethod
+    def update_last_csv_path(csv_path: str):
+        """Update the last CSV path in the environment (for future sessions)"""
+        # Note: This doesn't modify the .env file directly, but you could if needed
+        # For now, we'll just store it in memory
+        pass
 
 
 class MedicentreV3InventoryImporter:
     """Enhanced Medicentre v3 Inventory Importer with robust prerequisite verification"""
 
     def __init__(
-    self, base_url: str, credentials: Dict, config: Dict, dry_run: bool = False
+    self, base_url: str, credentials: Dict, config: Dict, dry_run: bool = False,
+    start_stage: str = None
 ):
         """Initialize enhanced importer
     
@@ -29,11 +74,13 @@ class MedicentreV3InventoryImporter:
             credentials: Dictionary with accesscode, username, password, branch
             config: Configuration dictionary with all settings
             dry_run: If True, only validate without importing
+            start_stage: Starting stage for resuming execution
         """
         self.base_url = base_url.rstrip("/")
         self.credentials = credentials
         self.config = config
         self.dry_run = dry_run
+        self.start_stage = start_stage
         self.driver = None
         self.wait = None
         self.logger = self.setup_logging()
@@ -86,11 +133,62 @@ class MedicentreV3InventoryImporter:
             "items_failed": 0,
             "items_skipped": 0,
         }
+        
+        # Track which stages have been completed
+        self.completed_stages = {
+            "login": False,
+            "accounts": False,
+            "vat": False,
+            "categories": False,
+            "classes": False,
+            "units": False,
+            "import": False
+        }
 
+        # Handle resume from specific stage
+        if start_stage:
+            self.setup_resume_stages(start_stage)
+    
+    def setup_resume_stages(self, start_stage: str):
+        """Mark stages as completed based on resume point"""
+        self.logger.info(f"Resuming from stage: {start_stage}")
+
+        # Stage completion order (from earliest to latest)
+        stage_order = ["login", "accounts", "vat", "categories", "classes", "units", "import"]
+
+        if start_stage == "upload":
+            # Skip all prerequisites EXCEPT login
+            for stage in ["accounts", "vat", "categories", "classes", "units"]:
+                self.completed_stages[stage] = True
+                self.logger.info(f"Marking stage '{stage}' as completed (skipping prerequisites)")
+            # DO NOT mark login as completed - we still need to login
+            self.resume_entry_point = "upload"
+            self.logger.info(f"Will login first, then go directly to upload")
+    
+        elif start_stage in self.completed_stages:
+            # Mark all stages up to (but not including) the selected stage as completed
+            try:
+                stage_index = stage_order.index(start_stage)
+                for i in range(stage_index):
+                    stage_name = stage_order[i]
+                    self.completed_stages[stage_name] = True
+                    self.logger.info(f"Marking stage '{stage_name}' as completed")
+
+                # Set the entry point for resumption
+                self.resume_entry_point = start_stage
+                self.logger.info(f"Will resume directly to '{start_stage}' stage")
+        
+            except ValueError:
+                self.logger.warning(f"Unknown stage '{start_stage}', starting from beginning")
+                self.resume_entry_point = None
+        else:
+            self.logger.warning(f"Invalid start stage '{start_stage}', starting from beginning")
+            self.resume_entry_point = None
+           
     def setup_logging(self):
         """Setup comprehensive logging configuration"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = Path("logs")
+        log_dir = Path(self.config.get("log_dir", "logs"))
         log_dir.mkdir(exist_ok=True)
 
         log_file = log_dir / f"medicentre_import_{timestamp}.log"
@@ -120,14 +218,14 @@ class MedicentreV3InventoryImporter:
         logger.addHandler(console_handler)
 
         # Screenshot directory
-        self.screenshot_dir = log_dir / "screenshots"
-        self.screenshot_dir.mkdir(exist_ok=True)
+        self.screenshot_dir = Path(self.config.get("screenshot_dir", "logs/screenshots"))
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
         return logger
 
     def take_screenshot(self, name: str):
         """Take screenshot and save to logs directory"""
-        if self.driver:
+        if self.driver and self.config.get("enable_screenshots", True):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             screenshot_path = self.screenshot_dir / f"{name}_{timestamp}.png"
             self.driver.save_screenshot(str(screenshot_path))
@@ -146,7 +244,7 @@ class MedicentreV3InventoryImporter:
 
         self.driver = webdriver.Edge(options=options)
         self.driver.maximize_window()
-        self.wait = WebDriverWait(self.driver, 30)
+        self.wait = WebDriverWait(self.driver, self.config.get("default_timeout", 30))
         self.logger.info("Browser driver initialized")
 
     def login(self) -> bool:
@@ -194,6 +292,7 @@ class MedicentreV3InventoryImporter:
             )
 
             self.session_active = True
+            self.completed_stages["login"] = True
             self.logger.info("✓ Login successful")
             return True
 
@@ -228,38 +327,94 @@ class MedicentreV3InventoryImporter:
     # ==================== CHART OF ACCOUNTS PANEL ====================
 
     def navigate_to_chart_of_accounts(self) -> bool:
-        """Navigate to Chart of Accounts panel and perform all actions there"""
+        """Navigate to COA panel and perform all actions there"""
         try:
-            # Expand Accounts module first
-            accounts_module = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//a[normalize-space()='Accounts']")
-                )
-            )
-            accounts_module.click()
-            time.sleep(1)
-
-            # Click Ledger Accounts
-            coa_link = self.wait.until(
+            self.logger.info("Attempting to navigate to Ledger accounts panel")
+            try:
+                # Click the COA panel
+                coa_link = self.wait.until(
                 EC.element_to_be_clickable(
                     (By.XPATH, "//a[normalize-space()='Ledger Accounts']")
+                    )
                 )
-            )
-            coa_link.click()
-            time.sleep(3)  # Wait for page to fully load
+                coa_link.click()
+                time.sleep(2)
 
-            # Verify we're on the right page
+                # Verify we're on the COA panel
+                if self.verify_coa_panel_loaded():
+                    self.logger.info("✓ Successfully navigated to the COA panel")
+                    return True
+                else:
+                    self.logger.warning("COA panel not loaded, trying fallback...")
+            except Exception as e1:
+                self.logger.warning(f"Navigation to COA panel failed: {e1}. Trying fallback...")
+        
+            # FALLBACK METHOD: Expand Accounts, select COA panel
             try:
-                self.driver.find_element(By.XPATH, "//h6[normalize-space()='View: Accounts']")
-                self.driver.find_element(By.XPATH, "//h6[normalize-space()='View: Sub-Accounts ()']")
-                self.logger.info("✓ Successfully navigated to Chart of Accounts")
-                return True
-            except:
-                self.logger.error("Chart of Accounts page elements not found")
+                self.logger.info("Trying fallback: Expanding Accounts module first...")
+
+                # Expand Accounts module if it's collapsed
+                try:
+                    accounts_module = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='Accounts']"))
+                        )
+                    accounts_module.click()
+                    time.sleep(1)
+                    self.logger.info("✓ Expanded Accounts module")
+                except Exception as e:
+                    self.logger.debug(f"Could not expand Accounts module: {e}")
+            
+                # Now try to click COA panel again
+                coa_link = self.wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//a[normalize-space()='Ledger Accounts']")
+                    )
+                )
+                coa_link.click()
+                time.sleep(3)  # Wait for page to fully load
+            
+                # Verify we're on the COA panel
+                if self.verify_coa_panel_loaded():
+                    self.logger.info("✓ Successfully navigated to the COA panel (fallback method)")
+                    return True
+                else:
+                    self.logger.error("COA panel not confirmed after fallback navigation")
+                    return False
+                
+            except Exception as e2:
+                self.logger.error(f"Fallback navigation to COA panel also failed: {e2}")
+                self.take_screenshot("navigate_to_COA_panel_failed")
                 return False
 
         except Exception as e:
-            self.logger.error(f"Navigation to Chart of Accounts failed: {str(e)}")
+            self.logger.error(f"Navigation to COA panel failed: {str(e)}")
+            return False
+
+    def verify_coa_panel_loaded(self) -> bool:
+        """Verify that the coa panel has loaded successfully"""
+        try:
+            # Check for multiple indicators that we're on the COA panel
+            page_indicators = [
+                "//h6[normalize-space()='View: Accounts']",
+                "//h6[normalize-space()='View: Sub-Accounts ()']",
+                "//input[@id='Account_Name']",
+                "//input[@id='SubAccount_Name']",
+            ]
+        
+            for indicator in page_indicators:
+                try:
+                    element = self.driver.find_element(By.XPATH, indicator)
+                    if element.is_displayed():
+                        self.logger.debug(f"COA panel verified with indicator: {indicator}")
+                        return True
+                except:
+                    continue
+        
+            self.logger.warning("Could not verify COA panel with any indicator")
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error verifying COA panel: {e}")
             return False
         
     def search_and_select_main_account(self, account_name: str) -> bool:
@@ -421,6 +576,7 @@ class MedicentreV3InventoryImporter:
     
             self.verification_stats['accounts_verified'] = accounts_verified
             self.verification_stats['accounts_created'] = accounts_created
+            self.completed_stages["accounts"] = True
     
             self.logger.info(f"✓ Ledger Accounts verification complete: {accounts_verified} verified, {accounts_created} created")
             return True
@@ -612,7 +768,7 @@ class MedicentreV3InventoryImporter:
                             try:
                                 cells = row.find_elements(By.TAG_NAME, "td")
                                 if cells:
-                                    cell_text = cells[0].text.strip()
+                                    cell_text = cells[1].text.strip()
                                     if cell_text.lower() == sub_account_name.lower():
                                         created = True
                                         break
@@ -846,20 +1002,102 @@ class MedicentreV3InventoryImporter:
     # ==================== TAXES/VAT PANEL ====================
 
     def navigate_to_taxes(self) -> bool:
-        """Navigate to Taxes/VAT panel and perform all actions there"""
+        """Navigate to Taxes/VAT panel and perform all actions there with fallback"""
         try:
-            # Click Taxes
-            taxes_link = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Taxes')]"))
-            )
-            taxes_link.click()
-            time.sleep(3)  # Wait for page to fully load
+            self.logger.info("Attempting to navigate to Taxes panel...")
 
-            self.logger.info("✓ Successfully navigated to Taxes panel")
-            return True
+            # FIRST ATTEMPT: Direct navigation to Taxes link
+            try:
+                taxes_link = self.wait.until(
+                    EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Taxes')]"))
+                )
+                taxes_link.click()
+                time.sleep(3)  # Wait for page to fully load
+            
+                # Verify we're on the Taxes page
+                if self.verify_taxes_page_loaded():
+                    self.logger.info("✓ Successfully navigated to Taxes panel (direct method)")
+                    return True
+                else:
+                    self.logger.warning("Taxes page not confirmed after direct navigation, trying fallback...")
+            except Exception as e1:
+                self.logger.warning(f"Direct navigation to Taxes failed: {e1}. Trying fallback...")
+        
+            # FALLBACK METHOD: Expand Accounts module first, then click Taxes
+            try:
+                self.logger.info("Trying fallback: Expanding Accounts module first...")
+
+                # Expand Accounts module if it's collapsed
+                try:
+                    # Look for collapsed Accounts module
+                    accounts_module = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='Accounts']"))
+                        )
+                    accounts_module.click()
+                    time.sleep(1)
+                    self.logger.info("✓ Expanded Accounts module")
+                except Exception as e:
+                    self.logger.debug(f"Could not expand Accounts module: {e}")
+            
+                # Now try to click Taxes link again
+                taxes_link = self.wait.until(
+                    EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Taxes')]"))
+                )
+                taxes_link.click()
+                time.sleep(3)  # Wait for page to fully load
+            
+                # Verify we're on the Taxes page
+                if self.verify_taxes_page_loaded():
+                    self.logger.info("✓ Successfully navigated to Taxes panel (fallback method)")
+                    return True
+                else:
+                    self.logger.error("Taxes page not confirmed after fallback navigation")
+                    return False
+
+            except Exception as e2:
+                self.logger.error(f"Fallback navigation to Taxes also failed: {e2}")
+                self.take_screenshot("navigate_to_taxes_failed")
+                return False
 
         except Exception as e:
             self.logger.error(f"Navigation to Taxes panel failed: {str(e)}")
+            self.take_screenshot("navigate_to_taxes_error")
+            return False
+
+    def verify_taxes_page_loaded(self) -> bool:
+        """Verify that the Taxes/VAT page has loaded successfully"""
+        try:
+            # Check for multiple indicators that we're on the Taxes page
+            page_indicators = [
+                "//h6[normalize-space()='VAT Type Details']",
+                "//h6[normalize-space()='View: VAT Types']",
+                "//h6[normalize-space()='Other Tax Details']",
+                "//input[@id='VATType_Name']",
+            ]
+        
+            for indicator in page_indicators:
+                try:
+                    element = self.driver.find_element(By.XPATH, indicator)
+                    if element.is_displayed():
+                        self.logger.debug(f"Taxes page verified with indicator: {indicator}")
+                        return True
+                except:
+                    continue
+        
+            # Also check page title or URL
+            try:
+                current_url = self.driver.current_url
+                if 'taxes' in current_url.lower():
+                    self.logger.debug(f"Taxes page verified by URL: {current_url}")
+                    return True
+            except:
+                pass
+        
+            self.logger.warning("Could not verify Taxes page with any indicator")
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error verifying Taxes page: {e}")
             return False
 
     def create_vat_types_bulk(self, missing_vat_types: List[str]) -> bool:
@@ -963,12 +1201,14 @@ class MedicentreV3InventoryImporter:
             if not missing_vat_types:
                 self.logger.info("✓ All VAT types from CSV exist in the system")
                 self.verification_stats['vat_verified'] = len(csv_vat_types)
+                self.completed_stages["vat"] = True
                 return True
     
             # Handle missing VAT types
             if self.dry_run:
                 self.logger.info(f"Would create {len(missing_vat_types)} missing VAT types (dry run)")
                 self.logger.info(f"Missing: {missing_vat_types}")
+                self.completed_stages["vat"] = True
                 return True
     
             print("\n" + "="*60)
@@ -987,12 +1227,19 @@ class MedicentreV3InventoryImporter:
             while True:
                 choice = input("\nSelect option (1-4): ").strip()
                 if choice == "1":
-                    return self.create_vat_types_bulk(missing_vat_types)
+                    result = self.create_vat_types_bulk(missing_vat_types)
+                    if result:
+                        self.completed_stages["vat"] = True
+                    return result
                 elif choice == "2":
-                    return self.create_vat_types_individual(missing_vat_types)
+                    result = self.create_vat_types_individual(missing_vat_types)
+                    if result:
+                        self.completed_stages["vat"] = True
+                    return result
                 elif choice == "3":
                     self.logger.warning(f"Skipping creation of {len(missing_vat_types)} VAT types")
                     self.verification_stats['vat_verified'] = len(csv_vat_types) - len(missing_vat_types)
+                    self.completed_stages["vat"] = True
                     return True  # Continue anyway
                 elif choice == "4":
                     self.logger.error("User chose to abort import due to missing VAT types")
@@ -1097,7 +1344,7 @@ class MedicentreV3InventoryImporter:
     def create_vat_type_in_panel(
         self, vat_name: str, vat_rate: int, tax_code: str = "E",
         liability_account: str = "Accrued Liabilities - Vat Payable"
-) -> bool:
+    ) -> bool:
         """Create a new VAT type in the Taxes panel"""
         try:
             # First, make sure we're on the Taxes page
@@ -1258,33 +1505,94 @@ class MedicentreV3InventoryImporter:
 
 
     # ==================== UNIT OF MEASURE PANEL ====================
-
     def navigate_to_unit_of_measure(self) -> bool:
-        """Navigate to Unit of Measure panel and perform all actions there"""
+        """Navigate to Unit of measures panel and perform all actions there"""
         try:
-            # Expand Inventory module
-            inventory_module = self.wait.until(
+            self.logger.info("Attempting to navigate to unit of measures panel")
+            try:
+                # Click unit of measures panel
+                uom_link = self.wait.until(
                 EC.element_to_be_clickable(
-                    (By.XPATH, "//a[normalize-space()='Inventory']")
+                    (By.XPATH, "//a[normalize-space()='Unit Of Measure']")
+                    )
                 )
-            )
-            inventory_module.click()
-            time.sleep(1)
+                uom_link.click()
+                time.sleep(3)  # Wait for page to fully load
 
-            # Click Unit of Measure
-            uom_link = self.wait.until(
+                # Verify we're on the Item Classses Modal
+                if self.verify_unit_of_measures_panel_loaded():
+                    self.logger.info("✓ Successfully navigated to the unit of measures panel")
+                    return True
+                else:
+                    self.logger.warning("Unit of measures panel not loaded, trying fallback...")
+            except Exception as e1:
+                self.logger.warning(f"Navigation to unit of measures panel failed: {e1}. Trying fallback...")
+        
+            # FALLBACK METHOD: Expand Inventory, select unit of measure
+            try:
+                self.logger.info("Trying fallback: Expanding Inventory module first...")
+
+                # Expand Inventory module if it's collapsed
+                try:
+                    inventory_module = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='Inventory']"))
+                        )
+                    inventory_module.click()
+                    time.sleep(1)
+                    self.logger.info("✓ Expanded Inventory module")
+                except Exception as e:
+                    self.logger.debug(f"Could not expand Inventory module: {e}")
+            
+                # Now try to unit of measure panel again
+                uom_link = self.wait.until(
                 EC.element_to_be_clickable(
-                    (By.XPATH, "(//a[normalize-space()='Unit Of Measure'])[1]")
+                    (By.XPATH, "//a[normalize-space()='Unit Of Measure']")
+                    )
                 )
-            )
-            uom_link.click()
-            time.sleep(3)  # Wait for page to fully load
+                uom_link.click()
+                time.sleep(3)  # Wait for page to fully load
 
-            self.logger.info("✓ Successfully navigated to Unit of Measure panel")
-            return True
+                # Verify we're on the unit of measure panel
+                if self.verify_unit_of_measures_panel_loaded():
+                    self.logger.info("✓ Successfully navigated to unit of measures panel (fallback method)")
+                    return True
+                else:
+                    self.logger.error("Unit of measures panel not confirmed after fallback navigation")
+                    return False
+                
+            except Exception as e2:
+                self.logger.error(f"Fallback navigation to unit of measures panel also failed: {e2}")
+                self.take_screenshot("navigate_to_unit_of_measures_panel_failed")
+                return False
 
         except Exception as e:
-            self.logger.error(f"Navigation to Unit of Measure panel failed: {str(e)}")
+            self.logger.error(f"Navigation to unit of measures failed: {str(e)}")
+            return False
+
+    def verify_unit_of_measures_panel_loaded(self) -> bool:
+        """Verify that the unit of measures panel has loaded successfully"""
+        try:
+            # Check for multiple indicators that we're on the unit of measures panel
+            page_indicators = [
+                "//input[@id='UnitOfMeasure_Name']",
+                "//h6[normalize-space()='Unit Of Measure Details']",
+                "//h6[normalize-space()='Unit Conversion Details']",
+            ]
+        
+            for indicator in page_indicators:
+                try:
+                    element = self.driver.find_element(By.XPATH, indicator)
+                    if element.is_displayed():
+                        self.logger.debug(f"Unit of measures panel verified with indicator: {indicator}")
+                        return True
+                except:
+                    continue
+        
+            self.logger.warning("Could not verify unit of measures panel with any indicator")
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error verifying unit of measures panel: {e}")
             return False
 
     def verify_and_create_units_in_panel(self, csv_data: List[Dict]) -> bool:
@@ -1394,6 +1702,7 @@ class MedicentreV3InventoryImporter:
 
             self.verification_stats["units_verified"] = units_verified
             self.verification_stats["units_created"] = units_created
+            self.completed_stages["units"] = True
 
             self.logger.info(
                 f"✓ Unit of Measure verification complete: {units_verified} verified, {units_created} created"
@@ -1408,21 +1717,21 @@ class MedicentreV3InventoryImporter:
             return False
     
     def check_unit_exists_with_search(self, unit_name: str) -> bool:
-        """Check if a unit exists using table search and row scanning"""
+        """Check if a unit exists using table search with exact matching"""
         try:
             # First try to use search if available
-            if self.search_unit_in_table(unit_name):
+            if self.search_unit_in_table_exact(unit_name):
                 return True
         
-            # If search not available or didn't work, fall back to full table scan
-            return self.scan_unit_table_for_match(unit_name)
+            # If search not available or didn't work, fall back to full table scan with exact match
+            return self.scan_unit_table_for_exact_match(unit_name)
         
         except Exception as e:
             self.logger.debug(f"Error checking unit existence: {e}")
             return False
 
-    def search_unit_in_table(self, unit_name: str) -> bool:
-        """Use the table search feature to find a unit"""
+    def search_unit_in_table_exact(self, unit_name: str) -> bool:
+        """Use the table search feature to find a unit with exact match"""
         try:
             # Look for search input - common selectors for DataTables
             search_selectors = [
@@ -1448,7 +1757,7 @@ class MedicentreV3InventoryImporter:
             # Use search
             search_box.clear()
             search_box.send_keys(unit_name)
-            time.sleep(1)  # Wait for table to filter
+            time.sleep(1.5)  # Wait for table to filter
         
             # Check if any rows appear in the filtered table
             try:
@@ -1475,15 +1784,16 @@ class MedicentreV3InventoryImporter:
                 if not rows:
                     rows = table.find_elements(By.XPATH, ".//tr[td]")  # Skip header
             
-                # Check if any row contains the exact unit name
+                # Check if any row contains the EXACT unit name (case-insensitive)
                 for row in rows:
                     try:
                         cells = row.find_elements(By.TAG_NAME, "td")
                         if cells:
                             # Get unit name in second column
                             cell_text = cells[1].text.strip()
+                            # Use regex-style exact match - the cell text must match exactly, not contain
                             if cell_text.lower() == unit_name.lower():
-                                self.logger.debug(f"Found unit '{unit_name}' via search")
+                                self.logger.debug(f"Found exact match for unit '{unit_name}' via search")
                                 return True
                     except:
                         continue
@@ -1494,14 +1804,19 @@ class MedicentreV3InventoryImporter:
                 # Always clear the search to not affect subsequent operations
                 search_box.clear()
                 time.sleep(0.5)
+                search_box.send_keys(Keys.RETURN)  # Trigger search to show all
             
         except Exception as e:
             self.logger.debug(f"Error during unit search: {e}")
             return False
 
-    def scan_unit_table_for_match(self, unit_name: str) -> bool:
-        """Scan the entire unit table for a match"""
+    def scan_unit_table_for_exact_match(self, unit_name: str) -> bool:
+        """Scan the entire unit table for an exact match (not partial)"""
         try:
+            # First clear any existing search to show all items
+            self.clear_unit_search()
+            time.sleep(1)
+        
             # Find the table
             table_selectors = [
                 "#unitofmeasurestable",
@@ -1527,9 +1842,9 @@ class MedicentreV3InventoryImporter:
             except:
                 rows = table.find_elements(By.XPATH, ".//tr")
         
-            self.logger.debug(f"Scanning {len(rows)} rows for unit '{unit_name}'")
+            self.logger.debug(f"Scanning {len(rows)} rows for exact unit match: '{unit_name}'")
         
-            # Scan each row
+            # Scan each row for exact match
             for row in rows:
                 try:
                     cells = row.find_elements(By.TAG_NAME, "td")
@@ -1537,14 +1852,9 @@ class MedicentreV3InventoryImporter:
                         # Unit name in second column
                         cell_text = cells[1].text.strip()
                     
-                        # Exact match
+                        # EXACT match only (not partial)
                         if cell_text.lower() == unit_name.lower():
-                            self.logger.debug(f"Found unit '{unit_name}' in table")
-                            return True
-                    
-                        # Partial match (in case of extra formatting)
-                        if unit_name.lower() in cell_text.lower():
-                            self.logger.debug(f"Found partial match: '{cell_text}' for '{unit_name}'")
+                            self.logger.debug(f"Found exact unit match: '{cell_text}' for '{unit_name}'")
                             return True
                 except Exception as e:
                     self.logger.debug(f"Error checking row: {e}")
@@ -1560,9 +1870,8 @@ class MedicentreV3InventoryImporter:
         """Clear any active search in the units table"""
         try:
             search_selectors = [
-                "#unitofmeasurestable",
-                "//table[@id='unitofmeasurestable']",
-                "(//table[@id='unitofmeasurestable'])[1]",
+                "input[aria-controls='unitofmeasurestable']",
+                "//input[@aria-controls='unitofmeasurestable']",
             ]
         
             for selector in search_selectors:
@@ -1582,38 +1891,98 @@ class MedicentreV3InventoryImporter:
     def navigate_to_item_categories(self) -> bool:
         """Navigate to Item Categories panel and perform all actions there"""
         try:
-            # Expand Configuration module
-            config_module = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//a[normalize-space()='Configuration']")
+            self.logger.info("Attempting to navigate to item categories")
+            try:
+                # Click Item categories
+                item_categories_button = self.wait.until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[@id='btnConfigureItemCat']")
+                    )
                 )
-            )
-            config_module.click()
-            time.sleep(1)
+                item_categories_button.click()
+                time.sleep(3)  # Wait for page to fully load
 
-            # Open Services panel
-            services_link = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//a[normalize-space()='Services']")
+                # Verify we're on the Item Categories Modal
+                if self.verify_item_categories_loaded():
+                    self.logger.info("✓ Successfully navigated to item categories modal")
+                    return True
+                else:
+                    self.logger.warning("Item Categories not opened, trying fallback...")
+            except Exception as e1:
+                self.logger.warning(f"Navigation to item categories failed: {e1}. Trying fallback...")
+        
+            # FALLBACK METHOD: Expand Configuration module first, click Services, and click Item Categories
+            try:
+                self.logger.info("Trying fallback: Expanding Configuration module first...")
+
+                # Expand Configuration module if it's collapsed
+                try:
+                    configuration_module = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='Configuration']"))
+                        )
+                    configuration_module.click()
+                    time.sleep(1)
+                    self.logger.info("✓ Expanded Configuration module")
+                except Exception as e:
+                    self.logger.debug(f"Could not expand Configuration module: {e}")
+            
+                # Now try to click Services link again
+                services_link = self.wait.until(
+                    EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Services')]"))
                 )
-            )
-            services_link.click()
-            time.sleep(1)
-
-            # Click Item Categories button to open modal
-            item_categories_button = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[@id='btnConfigureItemCat']")
+                services_link.click()
+                time.sleep(3)  # Wait for page to fully load
+            
+                # Click Item Categories button
+                item_categories_button = self.wait.until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[@id='btnConfigureItemCat']")
+                    )
                 )
-            )
-            item_categories_button.click()
-            time.sleep(3)  # Wait for modal to fully load  
+                item_categories_button.click()
+                time.sleep(3)  # Wait for page to fully load
 
-            self.logger.info("✓ Successfully navigated to Item Categories modal")
-            return True
+                # Verify we're on the item categories panel
+                if self.verify_item_categories_loaded():
+                    self.logger.info("✓ Successfully navigated to the Item Categories panel (fallback method)")
+                    return True
+                else:
+                    self.logger.error("Item categories page not confirmed after fallback navigation")
+                    return False
+                
+            except Exception as e2:
+                self.logger.error(f"Fallback navigation to item categories also failed: {e2}")
+                self.take_screenshot("navigate_to_item_categories_failed")
+                return False
 
         except Exception as e:
-            self.logger.error(f"Navigation to Item Categories modal failed: {str(e)}")
+            self.logger.error(f"Navigation to Item Categories panel failed: {str(e)}")
+            return False
+
+    def verify_item_categories_loaded(self) -> bool:
+        """Verify that the item categories panel has loaded successfully"""
+        try:
+            # Check for multiple indicators that we're on the item categories panel
+            page_indicators = [
+                "///input[@id='ItemCategory_Name']",
+                "//input[@id='ItemCategory_Code']",
+                "//button[@id='btnadditemcat']",
+            ]
+        
+            for indicator in page_indicators:
+                try:
+                    element = self.driver.find_element(By.XPATH, indicator)
+                    if element.is_displayed():
+                        self.logger.debug(f"Item Categories panel verified with indicator: {indicator}")
+                        return True
+                except:
+                    continue
+        
+            self.logger.warning("Could not verify item categories panel with any indicator")
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"Error verifying item categories panel: {e}")
             return False
 
     def verify_and_create_categories_in_panel(self, csv_data: List[Dict]) -> bool:
@@ -1723,6 +2092,7 @@ class MedicentreV3InventoryImporter:
 
             self.verification_stats["categories_verified"] = categories_verified
             self.verification_stats["categories_created"] = categories_created
+            self.completed_stages["categories"] = True
         
             # Close the item categories modal after processing
             self.close_item_categories_modal()
@@ -1778,21 +2148,13 @@ class MedicentreV3InventoryImporter:
                         # Try different column indices - usually Name is in second column
                         cell_text = cells[1].text.strip() if len(cells) > 1 else cells[0].text.strip()
                     
+                        # EXACT match check (not partial)
                         if cell_text.lower() == category_name.lower():
-                            self.logger.debug(f"Found category '{category_name}' in table")
-                            return True
-                        
-                        # Also check for partial matches (in case of extra spaces, etc.)
-                        if category_name.lower() in cell_text.lower():
-                            self.logger.debug(f"Found partial match for '{category_name}': '{cell_text}'")
+                            self.logger.debug(f"Found exact category match: '{category_name}' in table")
                             return True
                 except Exception as e:
                     self.logger.debug(f"Error checking row: {e}")
                     continue
-        
-            # If not found, try with a search if available
-            if not self.try_table_search(category_name):
-                self.logger.debug(f"Category '{category_name}' not found in table")
         
             return False
         
@@ -1838,20 +2200,94 @@ class MedicentreV3InventoryImporter:
     def navigate_to_item_classes(self) -> bool:
         """Navigate to Item Classes panel and perform all actions there"""
         try:
-            # Click Item Classes
-            item_classes_button = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[normalize-space()='Item Classes']")
+            self.logger.info("Attempting to navigate to item classes")
+            try:
+                # Click Item Classes
+                item_classes_button = self.wait.until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[normalize-space()='Item Classes']")
+                    )
                 )
-            )
-            item_classes_button.click()
-            time.sleep(3)  # Wait for page to fully load
+                item_classes_button.click()
+                time.sleep(3)  # Wait for page to fully load
 
-            self.logger.info("✓ Successfully navigated to Item Classes panel")
-            return True
+                # Verify we're on the Item Classses Modal
+                if self.verify_item_classes_loaded():
+                    self.logger.info("✓ Successfully navigated to item classes modal")
+                    return True
+                else:
+                    self.logger.warning("Item classes not opened, trying fallback...")
+            except Exception as e1:
+                self.logger.warning(f"Navigation to item classes failed: {e1}. Trying fallback...")
+        
+            # FALLBACK METHOD: Expand Configuration module first, click Services, and click Item Classes
+            try:
+                self.logger.info("Trying fallback: Expanding Configuration module first...")
+
+                # Expand Configuration module if it's collapsed
+                try:
+                    configuration_module = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='Configuration']"))
+                        )
+                    configuration_module.click()
+                    time.sleep(1)
+                    self.logger.info("✓ Expanded Configuration module")
+                except Exception as e:
+                    self.logger.debug(f"Could not expand Configuration module: {e}")
+            
+                # Now try to click Services link again
+                services_link = self.wait.until(
+                    EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Services')]"))
+                )
+                services_link.click()
+                time.sleep(3)  # Wait for page to fully load
+            
+                # Click Item Classes button
+                item_classes_button.click()
+                time.sleep(3)  # Wait for page to fully load
+
+                # Verify we're on the item classes panel
+                if self.verify_item_classes_loaded():
+                    self.logger.info("✓ Successfully navigated to Services panel (fallback method)")
+                    return True
+                else:
+                    self.logger.error("Services page not confirmed after fallback navigation")
+                    return False
+                
+            except Exception as e2:
+                self.logger.error(f"Fallback navigation to item classes also failed: {e2}")
+                self.take_screenshot("navigate_to_item_classes_failed")
+                return False
 
         except Exception as e:
             self.logger.error(f"Navigation to Item Classes panel failed: {str(e)}")
+            return False
+
+    def verify_item_classes_loaded(self) -> bool:
+        """Verify that the item classes panel has loaded successfully"""
+        try:
+            # Check for multiple indicators that we're on the item classes panel
+            page_indicators = [
+                "//input[@id='ItemClass_Name']",
+                "//input[@id='ItemClass_Description']",
+                "//h6[normalize-space()='View: Item Classes']",
+                "//button[@id='btnadditemclass']",
+            ]
+        
+            for indicator in page_indicators:
+                try:
+                    element = self.driver.find_element(By.XPATH, indicator)
+                    if element.is_displayed():
+                        self.logger.debug(f"Item classes panel verified with indicator: {indicator}")
+                        return True
+                except:
+                    continue
+        
+            self.logger.warning("Could not verify item classes panel with any indicator")
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error verifying item classes panel: {e}")
             return False
 
     def verify_and_create_classes_in_panel(self, csv_data: List[Dict]) -> bool:
@@ -1960,6 +2396,7 @@ class MedicentreV3InventoryImporter:
 
             self.verification_stats["classes_verified"] = classes_verified
             self.verification_stats["classes_created"] = classes_created
+            self.completed_stages["classes"] = True
             
             # Close the item classes modal after processing
             self.close_item_classes_modal()
@@ -2010,31 +2447,108 @@ class MedicentreV3InventoryImporter:
             return False
 
     # ==================== INVENTORY ITEMS PANEL ====================
-
     def navigate_to_inventory_items(self) -> bool:
-        """Navigate to Inventory Items panel and perform all actions there"""
+        """Navigate to Inventory panel and perform all actions there"""
         try:
-            # Click Inventory
-            inventory_panel = self.wait.until(
+            self.logger.info("Attempting to navigate to inventory panel")
+            try:
+                # Click the inventory panel
+                inventory_panel = self.wait.until(
                 EC.element_to_be_clickable(
                     (By.XPATH, "(//a[normalize-space()='Inventory'])[2]")
+                    )
                 )
-            )
-            inventory_panel.click()
-            time.sleep(2)
+                inventory_panel.click()
+                time.sleep(2)
 
-            # Select storage location
-            storage_select = Select(
-                self.driver.find_element(By.XPATH, "//select[@id='ItemStorageLocation_StorageLocationID']")
-            )
-            storage_select.select_by_visible_text(self.config["storage_location"])
-            time.sleep(2)
+                # Select storage location
+                storage_select = Select(
+                    self.driver.find_element(By.XPATH, "//select[@id='ItemStorageLocation_StorageLocationID']")
+                )
+                storage_select.select_by_visible_text(self.config["storage_location"])
+                time.sleep(2)
 
-            self.logger.info("✓ Successfully navigated to Inventory Items panel")
-            return True
+                # Verify we're on the inventory panel
+                if self.verify_inventory_panel_loaded():
+                    self.logger.info("✓ Successfully navigated to the inventory panel")
+                    return True
+                else:
+                    self.logger.warning("Inventory panel not loaded, trying fallback...")
+            except Exception as e1:
+                self.logger.warning(f"Navigation to inventory panel failed: {e1}. Trying fallback...")
+        
+            # FALLBACK METHOD: Expand Inventory, select inventory panel, choose storage location
+            try:
+                self.logger.info("Trying fallback: Expanding Inventory module first...")
+
+                # Expand Inventory module if it's collapsed
+                try:
+                    inventory_module = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, "//a[normalize-space()='Inventory']"))
+                        )
+                    inventory_module.click()
+                    time.sleep(1)
+                    self.logger.info("✓ Expanded Inventory module")
+                except Exception as e:
+                    self.logger.debug(f"Could not expand Inventory module: {e}")
+            
+                # Now try to click inventory panel again
+                inventory_panel = self.wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "(//a[normalize-space()='Inventory'])[2]")
+                    )
+                )
+                inventory_panel.click()
+                time.sleep(3)  # Wait for page to fully load
+            
+                # Select storage location
+                storage_select = Select(
+                    self.driver.find_element(By.XPATH, "//select[@id='ItemStorageLocation_StorageLocationID']")
+                )
+                storage_select.select_by_visible_text(self.config["storage_location"])
+                time.sleep(2)
+
+                # Verify we're on the inventory panel
+                if self.verify_inventory_panel_loaded():
+                    self.logger.info("✓ Successfully navigated to inventory panel (fallback method)")
+                    return True
+                else:
+                    self.logger.error("Inventory panel not confirmed after fallback navigation")
+                    return False
+                
+            except Exception as e2:
+                self.logger.error(f"Fallback navigation to inventory panel also failed: {e2}")
+                self.take_screenshot("navigate_to_inventory_panel_failed")
+                return False
 
         except Exception as e:
-            self.logger.error(f"Navigation to Inventory Items panel failed: {str(e)}")
+            self.logger.error(f"Navigation to Inventory panel failed: {str(e)}")
+            return False
+
+    def verify_inventory_panel_loaded(self) -> bool:
+        """Verify that the inventory panel has loaded successfully"""
+        try:
+            # Check for multiple indicators that we're on the inventory panel
+            page_indicators = [
+                "//input[@id='Item_Name']",
+                "//button[@id='btnViewReservedItems']",
+                "//input[@id='ItemStorageLocation_ExpiryDate']",
+            ]
+        
+            for indicator in page_indicators:
+                try:
+                    element = self.driver.find_element(By.XPATH, indicator)
+                    if element.is_displayed():
+                        self.logger.debug(f"Inventory panel verified with indicator: {indicator}")
+                        return True
+                except:
+                    continue
+                    
+            self.logger.warning("Could not verify inventory panel with any indicator")
+            return False
+        
+        except Exception as e:
+            self.logger.debug(f"Error verifying inventory panel: {e}")
             return False
 
     def upload_inventory_csv_in_panel(self, csv_path: str) -> bool:
@@ -2084,17 +2598,18 @@ class MedicentreV3InventoryImporter:
                 upload_button.click()
                 time.sleep(2)
 
-                # Wait for upload to complete with dynamic timeout
-                import_success = self.wait_for_upload_completion()
+                # Wait for upload to complete with success notification
+                import_success = self.wait_for_upload_completion_with_notification()
             
                 if not import_success:
                     self.logger.error("✗ Upload process did not complete successfully")
                     return False
-                # Close upload modal if it's still open
+                
+                # Close upload modal only after success notification
                 self.close_upload_modal()
             
                 # Wait for inventory table to refresh
-                time.sleep(3)
+                time.sleep(5)  # Increased wait time for backend processing
             
                 # Now verify what was actually imported
                 verification_result = self.verify_imported_items(csv_items)
@@ -2107,6 +2622,10 @@ class MedicentreV3InventoryImporter:
                 # Log detailed results
                 self.log_import_verification_details(verification_result)
             
+                self.completed_stages["import"] = True
+
+                # Return both success flag and verification result
+                self.last_verification_result = verification_result
                 return verification_result["imported_count"] > 0
 
             except Exception as e:
@@ -2126,52 +2645,113 @@ class MedicentreV3InventoryImporter:
             self.take_screenshot("inventory_panel_upload_process_error")
             return False
     
-    def wait_for_upload_completion(self, timeout: int = 30) -> bool:
-        """Wait for upload to complete and return success status"""
+    def wait_for_upload_completion_with_notification(self, timeout: int = 300) -> bool:
+        """Wait for upload to complete and return success status based on system notification"""
         try:
             start_time = time.time()
+            success_notification_seen = False
+            last_progress_log = start_time
+
+            self.logger.info(f"Waiting for upload completion (timeout: {timeout} seconds)...")
 
             while time.time() - start_time < timeout:
-                # Check for success notification
+                elapsed = time.time() - start_time
+
+                 # Log progress every 30 seconds
+                if time.time() - last_progress_log > 30:
+                    self.logger.info(f"Still waiting for upload completion... ({int(elapsed)} seconds elapsed)")
+                    last_progress_log = time.time()
+
+                # Check for success notification with specific patterns
                 try:
-                    success_msg = self.driver.find_element(
-                        By.XPATH, "//div[@class='noty_body']"
-                    )
-                    if success_msg.is_displayed():
-                        message_text = success_msg.text
-                        self.logger.info(f"✓ Upload successful: {message_text}")
-                        return True
-                except:
-                    pass
+                    # Look for notification with import completion message
+                    notification_selectors = [
+                        "//div[@class='noty_body']",
+                        "//div[contains(@class, 'noty_body')]",
+                        "//div[contains(@class, 'alert-success')]",
+                        "//div[contains(@class, 'alert') and contains(text(), 'import')]",
+                    ]
+                    
+                    for selector in notification_selectors:
+                        try:
+                            notification = self.driver.find_element(By.XPATH, selector)
+                            if notification.is_displayed():
+                                message_text = notification.text.lower()
+                                self.logger.info(f"Notification found: {notification.text}")
+                                
+                                # Check for success patterns
+                                success_patterns = [
+                                    'imported successfully',
+                                    'out of',  # e.g., "4 out of 4 items imported"
+                                    'successfully imported',
+                                    'upload successful'
+                                ]
+                                
+                                # Check for failure patterns (partial success is still success)
+                                failure_patterns = [
+                                    'failed to import',
+                                    'import failed',
+                                    'error',
+                                    'invalid'
+                                ]
+                                
+                                is_success = any(pattern in message_text for pattern in success_patterns)
+                                is_failure = any(pattern in message_text for pattern in failure_patterns)
+                                
+                                # Even partial success messages (e.g., "3 out of 4 items imported") are considered success
+                                if is_success or ('out of' in message_text and not is_failure):
+                                    self.logger.info(f"✓ Upload completed with message: {notification.text}")
+                                    success_notification_seen = True
+                                    break
+                                elif is_failure:
+                                    self.logger.error(f"✗ Upload failed with message: {notification.text}")
+                                    return False
+                        except:
+                            continue
+                    
+                    if success_notification_seen:
+                        self.logger.info(f"Upload completed successfully in {int(time.time() - start_time)} seconds")
+                        break
+                        
+                except Exception as e:
+                    self.logger.debug(f"Error checking notification: {e}")
                 
-                # Check for error notification
-                try:
-                    error_msg = self.driver.find_element(
-                        By.XPATH, "(//div[@class='noty_body'])[1]"
-                    )
-                    if error_msg.is_displayed():
-                        message_text = error_msg.text
-                        self.logger.error(f"✗ Upload failed: {message_text}")
-                        return False
-                except:
-                    pass
-                
-                # Check if modal is closed (indicating completion)
+                # Check for modal still being open
                 try:
                     modal = self.driver.find_element(
-                        By.XPATH, "//div[contains(@class, 'modal fade') and contains(@class, 'in')]"
+                        By.XPATH, "//div[contains(@class, 'modal fade import-products-modal') and contains(@class, 'in')]"
                     )
-                    if not modal.is_displayed():
-                        self.logger.info("✓ Upload modal closed, assuming completion")
-                        return True
+                    if modal.is_displayed():
+                        self.logger.debug("Upload modal still open, waiting...")
+                    else:
+                        # If modal closed without notification, check if we should continue
+                        if not success_notification_seen:
+                            self.logger.warning("Modal closed without notification, checking for success...")
+                            # Give system a moment to process
+                            time.sleep(3)
+                            break
                 except:
-                    # Modal not found, might be already closed
+                    # Modal not found
                     pass
                 
-                time.sleep(1)
+                time.sleep(2)  # Check every 2 seconds
             
-            self.logger.warning("Upload completion check timed out")
-            return False
+            if not success_notification_seen:
+                self.logger.warning("Upload completion notification not seen within timeout")
+                # Check if modal is still open
+                try:
+                    modal = self.driver.find_element(
+                        By.XPATH, "//div[contains(@class, 'modal fade import-products-modal') and contains(@class, 'in')]"
+                    )
+                    if modal.is_displayed():
+                        self.logger.error("Upload modal still open after timeout")
+                        return False
+                except:
+                    # Modal closed, might have succeeded without notification
+                    self.logger.info("Modal closed, assuming upload completed")
+                    return True
+            
+            return success_notification_seen
         
         except Exception as e:
             self.logger.error(f"Error waiting for upload completion: {e}")
@@ -2180,40 +2760,48 @@ class MedicentreV3InventoryImporter:
     def close_upload_modal(self):
         """Close the upload modal if it's open"""
         try:
-            # Try multiple close button selectors
-            close_selectors = [
-                "//div[contains(@class, 'modal')]//button[@data-dismiss='modal']",
-                "//div[@class='modal fade import-products-modal in']//span[@aria-hidden='true'][normalize-space()='×']",
-                "div[class='modal fade import-products-modal in'] span[aria-hidden='true']",
-                "(//span[@aria-hidden='true'][normalize-space()='×'])[3]",
-                "//div[contains(@class, 'modal')]//button[contains(text(), 'Close')]",
-                "//div[contains(@class, 'modal')]//span[@aria-hidden='true'][normalize-space()='×']",
-                "//button[@aria-label='Close']",
-            ]
-        
-            for selector in close_selectors:
-                try:
-                    close_button = self.driver.find_element(By.XPATH, selector)
-                    if close_button.is_displayed() and close_button.is_enabled():
-                        close_button.click()
-                        time.sleep(1)
-                        self.logger.info("✓ Upload modal closed")
-                        break
-                except:
-                    continue
-                
-            # If modal is still open, try Escape key
+            # Wait a moment to ensure any success notification is processed
+            time.sleep(2)
+            
+            # Check if modal is still open
             try:
                 modal = self.driver.find_element(
-                    By.XPATH, "//div[contains(@class, 'modal fade') and contains(@class, 'in')]"
+                    By.XPATH, "//div[contains(@class, 'modal fade import-products-modal') and contains(@class, 'in')]"
                 )
                 if modal.is_displayed():
+                    self.logger.info("Closing upload modal...")
+                    
+                    # Try multiple close button selectors
+                    close_selectors = [
+                        "//div[contains(@class, 'modal fade import-products-modal')]//button[@data-dismiss='modal']",
+                        "//div[@class='modal fade import-products-modal in']//span[@aria-hidden='true'][normalize-space()='×']",
+                        "div[class='modal fade import-products-modal in'] span[aria-hidden='true']",
+                        "(//span[@aria-hidden='true'][normalize-space()='×'])[3]",
+                        "//div[contains(@class, 'modal')]//button[contains(text(), 'Close')]",
+                        "//div[contains(@class, 'modal')]//span[@aria-hidden='true'][normalize-space()='×']",
+                        "//button[@aria-label='Close']",
+                    ]
+                
+                    for selector in close_selectors:
+                        try:
+                            close_button = self.driver.find_element(By.XPATH, selector)
+                            if close_button.is_displayed() and close_button.is_enabled():
+                                close_button.click()
+                                time.sleep(1)
+                                self.logger.info("✓ Upload modal closed")
+                                return
+                        except:
+                            continue
+                        
+                    # If no close button found, try Escape key
                     self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
                     time.sleep(1)
                     self.logger.info("✓ Upload modal closed with Escape key")
+                else:
+                    self.logger.info("Upload modal already closed")
             except:
-                pass
-            
+                self.logger.info("No upload modal found (likely already closed)")
+                
         except Exception as e:
             self.logger.debug(f"Could not close upload modal: {e}")
 
@@ -2242,17 +2830,10 @@ class MedicentreV3InventoryImporter:
             return []
 
     def verify_imported_items(self, csv_items: List[Dict]) -> Dict:
-        """Verify which items from CSV were actually imported using Name and Batch No"""
+        """Verify which items from CSV were actually imported using search for each item"""
         try:
-            self.logger.info("=== Verifying imported items against inventory table ===")
-        
-            # Make sure we're on the inventory page
-            # self.navigate_to_inventory_items()
-            time.sleep(3)  # Give extra time for table to load
-        
-            # Get all items currently in the inventory table
-            inventory_items = self.get_inventory_table_items()
-        
+            self.logger.info("=== Verifying imported items using targeted search ===")
+    
             # Initialize results
             results = {
                 'imported_items': [],      # Items found in both CSV and inventory
@@ -2266,141 +2847,18 @@ class MedicentreV3InventoryImporter:
                 'partial_matches': [],     # Items with name match but batch mismatch
                 'verification_errors': []  # Any errors during verification
             }
-        
-            if not inventory_items:
-                self.logger.warning("No items found in inventory table - may be empty or table not loaded")
-                # All CSV items are considered failed
-                for csv_item in csv_items:
-                    results['failed_items'].append({
-                        'csv_line': csv_item['line_number'],
-                        'csv_name': csv_item['name'],
-                        'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
-                        'reason': 'Inventory table appears empty or not loaded'
-                    })
-                    results['failed_count'] += 1
-                return results
-        
-            # Create lookup dictionary: key = (name_lower, batch_lower)
-            inventory_lookup = {}
-            table_name_counts = {}  # Track duplicates in table
-
-            for inv_item in inventory_items:
-                name_key = inv_item['name'].lower()
-                batch_key = inv_item.get('batch', '').lower()
-            
-                # Create composite key
-                composite_key = f"{name_key}|{batch_key}"
-            
-                # Check for duplicates in table
-                if composite_key in inventory_lookup:
-                    if composite_key not in results['table_duplicates']:
-                        results['table_duplicates'].append({
-                            'name': inv_item['name'],
-                            'batch': inv_item.get('batch', ''),
-                            'count': 2  # Starting count
-                        })
-                    else:
-                        # Increment count for existing duplicate
-                        for dup in results['table_duplicates']:
-                            if dup['name'].lower() == name_key and dup['batch'].lower() == batch_key:
-                                dup['count'] += 1
-                                break
-                else:
-                    inventory_lookup[composite_key] = inv_item
-            
-                # Track name counts for duplicate detection
-                table_name_counts[name_key] = table_name_counts.get(name_key, 0) + 1
-
-            # Track found items to avoid double counting
-            found_composite_keys = set()
-        
-            # Check each CSV item against inventory
-            for csv_item in csv_items:
-                csv_name = csv_item['name'].lower()
-                csv_batch = csv_item.get('original_row', {}).get('Batch', '').lower()
-            
-                composite_key = f"{csv_name}|{csv_batch}"
-            
-                # Try exact match (name + batch)
-                if composite_key in inventory_lookup:
-                    inv_item = inventory_lookup[composite_key]
-                    results['imported_items'].append({
-                        'csv_line': csv_item['line_number'],
-                        'csv_name': csv_item['name'],
-                        'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
-                        'inventory_name': inv_item['name'],
-                        'inventory_batch': inv_item.get('batch', ''),
-                        'match_type': 'exact',
-                        'match_details': f"Name: '{csv_item['name']}', Batch: '{csv_item.get('original_row', {}).get('Batch', '')}'"
-                    })
-                    results['imported_count'] += 1
-                    found_composite_keys.add(composite_key)
-                
-                # Try name-only match (batch might be different or empty)
-                elif csv_name in [item['name'].lower() for item in inventory_items]:
-                    # Find all inventory items with this name
-                    matching_items = [item for item in inventory_items if item['name'].lower() == csv_name]
-                
-                    if len(matching_items) == 1:
-                        # Single match by name
-                        inv_item = matching_items[0]
-                        results['imported_items'].append({
-                            'csv_line': csv_item['line_number'],
-                            'csv_name': csv_item['name'],
-                            'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
-                            'inventory_name': inv_item['name'],
-                            'inventory_batch': inv_item.get('batch', ''),
-                            'match_type': 'name_only',
-                            'match_details': f"Name matched but batch differs: CSV='{csv_item.get('original_row', {}).get('Batch', '')}', Inventory='{inv_item.get('batch', '')}'",
-                            'warning': 'Batch number mismatch'
-                        })
-                        results['imported_count'] += 1
-                        found_composite_keys.add(f"{csv_name}|{inv_item.get('batch', '').lower()}")
-                    
-                    elif len(matching_items) > 1:
-                        # Multiple items with same name - partial match
-                        results['partial_matches'].append({
-                            'csv_line': csv_item['line_number'],
-                            'csv_name': csv_item['name'],
-                            'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
-                            'matching_inventory_items': [
-                                {'name': item['name'], 'batch': item.get('batch', '')} 
-                                for item in matching_items
-                            ],
-                            'match_type': 'multiple_name_matches'
-                        })
-                        # Count as imported but with warning
-                        results['imported_items'].append({
-                            'csv_line': csv_item['line_number'],
-                            'csv_name': csv_item['name'],
-                            'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
-                            'inventory_name': csv_item['name'],
-                            'inventory_batch': 'MULTIPLE',
-                            'match_type': 'multiple_name_matches',
-                            'match_details': f"Multiple inventory items with name '{csv_item['name']}'",
-                            'warning': 'Multiple items with same name found'
-                        })
-                        results['imported_count'] += 1
-                    
-                # Item not found at all
-                else:
-                    results['failed_items'].append({
-                        'csv_line': csv_item['line_number'],
-                        'csv_name': csv_item['name'],
-                        'csv_batch': csv_item.get('original_row', {}).get('Batch', ''),
-                        'reason': 'No matching item found in inventory table',
-                        'search_criteria': f"Name: '{csv_item['name']}', Batch: '{csv_item.get('original_row', {}).get('Batch', '')}'"
-                    })
-                    results['failed_count'] += 1
-        
-            # Check for duplicate items in CSV
+    
+            # Make sure we're on the inventory page
+            time.sleep(5)  # Give extra time for table to load after import
+    
+            # Check for duplicate items in CSV first
             csv_name_batch_counts = {}
             for csv_item in csv_items:
                 csv_name = csv_item['name'].lower()
                 csv_batch = csv_item.get('original_row', {}).get('Batch', '').lower()
                 key = f"{csv_name}|{csv_batch}"
                 csv_name_batch_counts[key] = csv_name_batch_counts.get(key, 0) + 1
-        
+    
             for key, count in csv_name_batch_counts.items():
                 if count > 1:
                     name, batch = key.split('|')
@@ -2415,11 +2873,78 @@ class MedicentreV3InventoryImporter:
                         'count': count,
                         'lines': [item['line_number'] for item in duplicate_items]
                     })
-        
-            self.logger.info(f"Verification complete: {results['imported_count']} imported, {results['failed_count']} failed")
+    
+            # For each CSV item, search for it individually
+            for csv_item in csv_items:
+                csv_name = csv_item['name']
+                csv_batch = csv_item.get('original_row', {}).get('Batch', '')
+            
+                self.logger.debug(f"Searching for: '{csv_name}' (Batch: '{csv_batch}')")
 
+                # Search for this specific item in the inventory table
+                search_result = self.search_item_in_inventory_table(csv_name, csv_batch)
+            
+                if search_result['found']:
+                    if search_result['match_type'] == 'exact':
+                        results['imported_items'].append({
+                            'csv_line': csv_item['line_number'],
+                            'csv_name': csv_name,
+                            'csv_batch': csv_batch,
+                            'inventory_name': search_result['inventory_name'],
+                            'inventory_batch': search_result['inventory_batch'],
+                            'match_type': 'exact',
+                            'match_details': f"Name: '{csv_name}', Batch: '{csv_batch}'"
+                        })
+                        results['imported_count'] += 1
+                
+                    elif search_result['match_type'] == 'name_only':
+                        results['imported_items'].append({
+                            'csv_line': csv_item['line_number'],
+                            'csv_name': csv_name,
+                            'csv_batch': csv_batch,
+                            'inventory_name': search_result['inventory_name'],
+                            'inventory_batch': search_result['inventory_batch'],
+                            'match_type': 'name_only',
+                            'match_details': f"Name matched but batch differs: CSV='{csv_batch}', Inventory='{search_result['inventory_batch']}'",
+                            'warning': 'Batch number mismatch'
+                        })
+                        results['imported_count'] += 1
+                
+                    elif search_result['match_type'] == 'multiple':
+                        results['imported_items'].append({
+                            'csv_line': csv_item['line_number'],
+                            'csv_name': csv_name,
+                            'csv_batch': csv_batch,
+                            'inventory_name': csv_name,
+                            'inventory_batch': 'MULTIPLE',
+                            'match_type': 'multiple_name_matches',
+                            'match_details': f"Multiple inventory items with name '{csv_name}'",
+                            'warning': 'Multiple items with same name found'
+                        })
+                        results['imported_count'] += 1
+                
+                    # Track table duplicates
+                    if search_result.get('duplicate_count', 0) > 1:
+                        results['table_duplicates'].append({
+                            'name': csv_name,
+                            'batch': csv_batch,
+                            'count': search_result['duplicate_count']
+                        })
+            
+                else:
+                    # Item not found
+                    results['failed_items'].append({
+                        'csv_line': csv_item['line_number'],
+                        'csv_name': csv_name,
+                        'csv_batch': csv_batch,
+                        'reason': 'No matching item found in inventory table',
+                        'search_criteria': f"Name: '{csv_name}', Batch: '{csv_batch}'"
+                    })  
+                    results['failed_count'] += 1
+    
+            self.logger.info(f"Verification complete: {results['imported_count']} imported, {results['failed_count']} failed")
             return results
-        
+    
         except Exception as e:
             self.logger.error(f"Error verifying imported items: {e}")
             self.take_screenshot("import_verification_error")
@@ -2435,7 +2960,155 @@ class MedicentreV3InventoryImporter:
                 'partial_matches': [],
                 'verification_errors': [str(e)]
             }
+    
+    def search_item_in_inventory_table(self, item_name: str, item_batch: str = "") -> Dict:
+        """Search for a specific item in the inventory table using the search box"""
+        try:
+            # First, clear any existing search
+            self.clear_inventory_search()
+            time.sleep(1)
+
+            # Find the search box in the inventory table
+            search_selectors = [
+                "//input[@aria-controls='inventoryitemstable']",
+                "(//input[@aria-controls='inventoryitemstable'])[1]",
+            ]
         
+            search_box = None
+            for selector in search_selectors:
+                try:
+                    search_box = self.driver.find_element(By.XPATH, selector)
+                    if search_box.is_displayed():
+                        self.logger.debug(f"Found search box with selector: {selector}")
+                        break
+                except:
+                    continue
+        
+            if not search_box:
+                self.logger.warning("No search box found in inventory table")
+                return {'found': False, 'error': 'Search box not found'}
+        
+            # Search by item name
+            search_box.clear()
+            search_box.send_keys(item_name)
+            time.sleep(2)  # Wait for table to filter
+        
+            # Check if any rows appear in the filtered table
+            try:
+                table = self.driver.find_element(By.XPATH, "//table[@id='inventoryitemstable']")
+
+                # Get filtered rows
+                rows = table.find_elements(By.XPATH, "//table[@id='inventoryitemstable']/tbody/tr")
+                if not rows:
+                    rows = table.find_elements(By.XPATH, ".//tr[td]")  # Skip header
+            
+                if not rows:
+                    self.logger.debug(f"No rows found for search term: '{item_name}'")
+                    return {'found': False, 'search_term': item_name}
+            
+                # Analyze the filtered results
+                matching_items = []
+                for row in rows:
+                    try:
+                        cells = row.find_elements(By.TAG_NAME, "td")
+                        if cells and len(cells) >= 2:
+                            name_cell = cells[0].text.strip()
+                            batch_cell = cells[1].text.strip() if len(cells) > 1 else ""
+                        
+                            # Check if name matches (case-insensitive)
+                            if name_cell.lower() == item_name.lower():
+                                matching_items.append({
+                                    'name': name_cell,
+                                    'batch': batch_cell,
+                                    'full_row': cells
+                                })
+                    except:
+                        continue
+            
+                if not matching_items:
+                    return {'found': False, 'search_term': item_name}
+            
+                # Determine match type
+                if len(matching_items) == 1:
+                    # Single match - check if batch matches
+                    matched_item = matching_items[0]
+                    if item_batch and matched_item['batch'].lower() == item_batch.lower():
+                        return {
+                            'found': True,
+                            'match_type': 'exact',
+                            'inventory_name': matched_item['name'],
+                            'inventory_batch': matched_item['batch'],
+                            'duplicate_count': 1
+                        }
+                    else:
+                        return {
+                            'found': True,
+                            'match_type': 'name_only',
+                            'inventory_name': matched_item['name'],
+                            'inventory_batch': matched_item['batch'],
+                            'duplicate_count': 1,
+                            'batch_mismatch': True if item_batch else False
+                        }
+                else:
+                    # Multiple items with the same name
+                    # Check if any match the batch exactly
+                    exact_batch_match = None
+                    for item in matching_items:
+                        if item_batch and item['batch'].lower() == item_batch.lower():
+                            exact_batch_match = item
+                            break
+                            
+                    if exact_batch_match:
+                        return {
+                            'found': True,
+                            'match_type': 'exact',
+                            'inventory_name': exact_batch_match['name'],
+                            'inventory_batch': exact_batch_match['batch'],
+                            'duplicate_count': len(matching_items),
+                            'total_matches': len(matching_items)
+                        }
+                    else:
+                        # Return first match with warning
+                        return {
+                            'found': True,
+                            'match_type': 'multiple',
+                            'inventory_name': matching_items[0]['name'],
+                            'inventory_batch': matching_items[0]['batch'],
+                            'duplicate_count': len(matching_items),
+                            'total_matches': len(matching_items),
+                            'all_matches': matching_items
+                        }
+            
+            finally:
+                # Clear search for next item
+                search_box.clear()
+                time.sleep(0.5)
+                search_box.send_keys(Keys.RETURN)  # Trigger search to show all
+        
+        except Exception as e:
+            self.logger.error(f"Error searching for item '{item_name}': {e}")
+            return {'found': False, 'error': str(e)}
+
+    def clear_inventory_search(self):
+        """Clear any active search in the inventory table"""
+        try:
+            search_selectors = [
+                "//input[@aria-controls='inventoryitemstable']",
+                "(//input[@aria-controls='inventoryitemstable'])[1]",
+            ]
+
+            for selector in search_selectors:
+                try:
+                    search_box = self.driver.find_element(By.XPATH, selector)
+                    search_box.clear()
+                    search_box.send_keys(Keys.RETURN)  # Trigger search to show all
+                    time.sleep(0.5)
+                    break
+                except:
+                    continue
+        except:
+            pass  # Silently fail if search can't be cleared
+
     def get_inventory_table_items(self) -> List[Dict]:
         """Extract items from the inventory table with Name and Batch No columns"""
         items = []
@@ -2447,7 +3120,7 @@ class MedicentreV3InventoryImporter:
                 EC.element_to_be_clickable((By.XPATH, "//button[@id='btnfilterproducts']"))
             )
             view_all_items_button.click()
-            time.sleep(3)
+            time.sleep(4)
         
             # Try different table selectors
             table_selectors = [
@@ -2822,14 +3495,33 @@ class MedicentreV3InventoryImporter:
         self.logger.info("STARTING PREREQUISITE VERIFICATION")
         self.logger.info("=" * 60)
 
-        # Define verification steps with panel-specific methods
-        verification_steps = [
-            ("Chart of Accounts", self.verify_and_create_accounts_in_panel),
-            ("Taxes/VAT Types", self.verify_vat_types_in_panel), 
-            ("Item Categories", self.verify_and_create_categories_in_panel),
-            ("Item Classes", self.verify_and_create_classes_in_panel),
-            ("Units of Measure", self.verify_and_create_units_in_panel),
-        ]
+        # If we're resuming from a specific point, we've already navigated there
+        if hasattr(self, 'resume_entry_point') and self.resume_entry_point:
+            self.logger.info(f"Already at resume point '{self.resume_entry_point}', skipping navigation")
+            return True
+
+        # Normal flow: Define verification steps with panel-specific methods
+        # Only include stages that haven't been completed yet
+        verification_steps = []
+
+        if not self.completed_stages.get("accounts", False):
+            verification_steps.append(("Chart of Accounts", self.verify_and_create_accounts_in_panel))
+
+        if not self.completed_stages.get("vat", False):
+            verification_steps.append(("Taxes/VAT Types", self.verify_vat_types_in_panel))
+    
+        if not self.completed_stages.get("categories", False):
+            verification_steps.append(("Item Categories", self.verify_and_create_categories_in_panel))
+    
+        if not self.completed_stages.get("classes", False):
+            verification_steps.append(("Item Classes", self.verify_and_create_classes_in_panel))
+    
+        if not self.completed_stages.get("units", False):
+            verification_steps.append(("Units of Measure", self.verify_and_create_units_in_panel))
+
+        if not verification_steps:
+            self.logger.info("All prerequisites have already been verified in previous run.")
+            return True
 
         for step_name, verification_func in verification_steps:
             self.logger.info(f"\n▶ Processing: {step_name}")
@@ -2854,14 +3546,159 @@ class MedicentreV3InventoryImporter:
             self.logger.info("✓ Dry run complete - skipping actual import")
             return True
 
-        return self.upload_inventory_csv_in_panel(csv_path)
+        # Import and get verification result
+        success = self.upload_inventory_csv_in_panel(csv_path)
+    
+        # Store verification result for reporting
+        self.last_import_verification = getattr(self, 'last_verification_result', None)
+    
+        return success
 
-    def generate_report(self) -> Dict:
-        """Generate comprehensive import report"""
+    def generate_detailed_txt_report(self, verification_result: Dict = None) -> str:
+        """Generate a detailed human-readable TXT report"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+        report_lines = []
+    
+        # Header
+        report_lines.append("=" * 80)
+        report_lines.append("MEDICENTRE v3 INVENTORY IMPORT REPORT")
+        report_lines.append("=" * 80)
+        report_lines.append(f"Report Generated: {timestamp}")
+        report_lines.append(f"Dry Run Mode: {'YES' if self.dry_run else 'NO'}")
+        report_lines.append(f"Resume Stage: {self.start_stage if self.start_stage else 'Full Import'}")
+        report_lines.append("=" * 80)
+    
+        # Prerequisite Summary
+        report_lines.append("\nPREREQUISITE SUMMARY")
+        report_lines.append("-" * 40)
+        report_lines.append(f"Chart of Accounts:")
+        report_lines.append(f"  ✓ Verified: {self.verification_stats['accounts_verified']}")
+        report_lines.append(f"  Created: {self.verification_stats['accounts_created']}")
+    
+        report_lines.append(f"\nVAT Types:")
+        report_lines.append(f"  ✓ Verified: {self.verification_stats['vat_verified']}")
+        report_lines.append(f"  ⚠ Errors: {self.verification_stats['vat_errors']}")
+    
+        report_lines.append(f"\nUnits of Measure:")
+        report_lines.append(f"  ✓ Verified: {self.verification_stats['units_verified']}")
+        report_lines.append(f"  Created: {self.verification_stats['units_created']}")
+    
+        report_lines.append(f"\nItem Categories:")
+        report_lines.append(f"  ✓ Verified: {self.verification_stats['categories_verified']}")
+        report_lines.append(f"  Created: {self.verification_stats['categories_created']}")
+    
+        report_lines.append(f"\nItem Classes:")
+        report_lines.append(f"  ✓ Verified: {self.verification_stats['classes_verified']}")
+        report_lines.append(f"  Created: {self.verification_stats['classes_created']}")
+    
+        # Inventory Import Summary
+        report_lines.append("\n" + "=" * 80)
+        report_lines.append("INVENTORY IMPORT SUMMARY")
+        report_lines.append("=" * 80)
+    
+        total_processed = (
+            self.verification_stats["items_imported"] +
+            self.verification_stats["items_failed"] +
+            self.verification_stats["items_skipped"]
+        )
+    
+        if total_processed > 0:
+            success_rate = (
+                (self.verification_stats["items_imported"] / total_processed) * 100
+            )
+        else:
+            success_rate = 0
+    
+        report_lines.append(f"\nOverall Statistics:")
+        report_lines.append(f"  Total Items Processed: {total_processed}")
+        report_lines.append(f"  ✓ Successfully Imported: {self.verification_stats['items_imported']}")
+        report_lines.append(f"  ✗ Failed to Import: {self.verification_stats['items_failed']}")
+        report_lines.append(f"  ⚠ Skipped: {self.verification_stats['items_skipped']}")
+        report_lines.append(f"  Success Rate: {success_rate:.1f}%")
+    
+        # Add detailed verification results if available
+        if verification_result:
+            report_lines.append("\n" + "-" * 40)
+            report_lines.append("DETAILED IMPORT VERIFICATION")
+            report_lines.append("-" * 40)
+        
+            # Imported Items
+            if verification_result['imported_items']:
+                report_lines.append(f"\nIMPORTED ITEMS ({len(verification_result['imported_items'])}):")
+                for i, item in enumerate(verification_result['imported_items'][:20], 1):
+                    batch_info = f", Batch: '{item['csv_batch']}'" if item['csv_batch'] else ""
+                    match_type = {
+                        'exact': '✓',
+                        'name_only': '⚠',
+                        'multiple_name_matches': '🔍'
+                    }.get(item['match_type'], '?')
+                
+                    report_lines.append(f"  {match_type} Line {item['csv_line']}: '{item['csv_name']}'{batch_info}")
+                    if 'warning' in item:
+                        report_lines.append(f"    Warning: {item['warning']}")
+        
+            # Failed Items
+            if verification_result['failed_items']:
+                report_lines.append(f"\nFAILED ITEMS ({len(verification_result['failed_items'])}):")
+                for i, item in enumerate(verification_result['failed_items'][:20], 1):
+                    batch_info = f", Batch: '{item['csv_batch']}'" if item['csv_batch'] else ""
+                    report_lines.append(f"  ✗ Line {item['csv_line']}: '{item['csv_name']}'{batch_info}")
+                    report_lines.append(f"    Reason: {item['reason']}")
+        
+            # Duplicate Items in CSV
+            if verification_result['duplicate_items']:
+                report_lines.append(f"\nDUPLICATE ITEMS IN CSV ({len(verification_result['duplicate_items'])}):")
+                for dup in verification_result['duplicate_items']:
+                    batch_info = f" (Batch: {dup['batch']})" if dup['batch'] != '(empty)' else ''
+                    report_lines.append(f"  ⚠ '{dup['name']}'{batch_info} appears {dup['count']} times")
+                    report_lines.append(f"    Line numbers: {', '.join(map(str, dup['lines']))}")
+        
+            # Table Duplicates
+            if verification_result.get('table_duplicates'):
+                report_lines.append(f"\nDUPLICATE ITEMS IN INVENTORY TABLE ({len(verification_result['table_duplicates'])}):")
+                for dup in verification_result['table_duplicates'][:10]:
+                    batch_info = f" (Batch: {dup['batch']})" if dup['batch'] else ''
+                    report_lines.append(f"  ⚠ '{dup['name']}'{batch_info} appears {dup['count']} times")
+    
+        # Session Information
+        report_lines.append("\n" + "=" * 80)
+        report_lines.append("SESSION INFORMATION")
+        report_lines.append("=" * 80)
+    
+        report_lines.append(f"\nConfiguration:")
+        report_lines.append(f"  Base URL: {self.base_url}")
+        report_lines.append(f"  Username: {self.credentials.get('username', 'N/A')}")
+        report_lines.append(f"  Branch: {self.credentials.get('branch', 'N/A')}")
+        report_lines.append(f"  Storage Location: {self.config.get('storage_location', 'N/A')}")
+    
+        # Stage Completion Status
+        report_lines.append(f"\nStage Completion:")
+        for stage, completed in self.completed_stages.items():
+            status = "✓ COMPLETED" if completed else "✗ PENDING"
+            report_lines.append(f"  {stage.title()}: {status}")
+
+        # Footer
+        report_lines.append("\n" + "=" * 80)
+        report_lines.append("END OF REPORT")
+        report_lines.append("=" * 80)
+    
+        return "\n".join(report_lines)
+
+    def generate_report(self, verification_result: Dict = None) -> Dict:
+        """Generate comprehensive import report in both TXT and JSON formats"""
         report = {
             "timestamp": datetime.now().isoformat(),
             "dry_run": self.dry_run,
+            "start_stage": self.start_stage,
             "verification_stats": self.verification_stats.copy(),
+            "completed_stages": self.completed_stages.copy(),
+            "configuration": {
+                "base_url": self.base_url,
+                "username": self.credentials.get('username'),
+                "branch": self.credentials.get('branch'),
+                "storage_location": self.config.get('storage_location')
+            },
             "summary": {
                 "total_prerequisites_created": (
                     self.verification_stats["accounts_created"]
@@ -2894,17 +3731,31 @@ class MedicentreV3InventoryImporter:
             },
         }
 
-        # Save report to file
+        # Save report to files
         report_dir = Path("reports")
         report_dir.mkdir(exist_ok=True)
 
-        report_file = (
-            report_dir
-            / f'import_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        with open(report_file, "w", encoding="utf-8") as f:
+        # Save JSON report (for programmatic use)
+        json_report_file = report_dir / f'import_report_{timestamp}.json'
+        with open(json_report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
+    
+        # Save TXT report (for human reading)
+        txt_report = self.generate_detailed_txt_report(verification_result)
+        txt_report_file = report_dir / f'import_report_{timestamp}.txt'
+        with open(txt_report_file, "w", encoding="utf-8") as f:
+            f.write(txt_report)
+    
+        # Save detailed verification results if available
+        if verification_result:
+            detailed_dir = report_dir / "detailed"
+            detailed_dir.mkdir(exist_ok=True)
+        
+            detailed_json_file = detailed_dir / f'detailed_verification_{timestamp}.json'
+            with open(detailed_json_file, "w", encoding="utf-8") as f:
+                json.dump(verification_result, f, indent=2, ensure_ascii=False)
 
         # Print summary to console
         print("\n" + "=" * 60)
@@ -2920,7 +3771,11 @@ class MedicentreV3InventoryImporter:
         print(f"  Failed: {self.verification_stats['items_failed']}")
         print(f"  Skipped: {self.verification_stats['items_skipped']}")
         print(f"\nSuccess Rate: {report['summary']['success_rate']:.1f}%")
-        print(f"\nReport saved to: {report_file}")
+        print(f"\nReports saved to:")
+        print(f"  Human-readable: {txt_report_file}")
+        print(f"  JSON format: {json_report_file}")
+        if verification_result:
+            print(f"  Detailed verification: {detailed_json_file}")
         print("=" * 60)
 
         return report
@@ -2934,26 +3789,65 @@ class MedicentreV3InventoryImporter:
                 reader = csv.DictReader(f)
                 csv_data = list(reader)
 
-            if not csv_data:
-                self.logger.error("✗ CSV file is empty or could not be read")
-                return self.verification_stats
+                if not csv_data:
+                    self.logger.error("✗ CSV file is empty or could not be read")
+                    return self.verification_stats
 
             self.logger.info(f"Loaded {len(csv_data)} items from CSV")
+    
+            # ===== HANDLE RESUME ENTRY POINT =====
+            if hasattr(self, 'resume_entry_point') and self.resume_entry_point:
+                self.logger.info(f"Resuming directly to stage: {self.resume_entry_point}")
 
-            # Step 1: Login once
-            if not self.login():
-                self.logger.error("✗ Login failed, cannot proceed")
-                return self.verification_stats
+                # Always login first, regardless of stage
+                if not self.login():
+                    self.logger.error("✗ Login failed, cannot resume")
+                    return self.verification_stats
 
-            # Step 2: Verify all prerequisites in their respective panels
-            if not self.verify_all_prerequisites(csv_data):
-                self.logger.error("✗ Prerequisite verification failed, aborting import")
-                return self.verification_stats
+                # For upload stage, skip directly to inventory import
+                if self.resume_entry_point == "upload":
+                    self.logger.info("✓ Skipping prerequisite verification as requested")
+                    # Go directly to inventory import
+                    import_success = self.import_inventory_data(cleaned_csv_path)
+                    if not import_success:
+                        self.logger.error("✗ Inventory import failed")
+                
+                    # Generate report
+                    report = self.generate_report(getattr(self, 'last_verification_result', None))
+                    return self.verification_stats
+            
+                # For other stages, navigate to appropriate panel
+                self.navigate_to_resume_point(self.resume_entry_point, csv_data)
+
+            else:
+                # Normal flow: Start from beginning
+                # Step 1: Login once (only if not already logged in)
+                if not self.completed_stages.get("login", False):
+                    if not self.login():
+                        self.logger.error("✗ Login failed, cannot proceed")
+                        return self.verification_stats
+                else:
+                    self.logger.info("✓ Already logged in from previous session")
+                    # Ensure driver is initialized
+                    if not self.driver:
+                        self.logger.warning("Driver not initialized, re-logging in...")
+                        if not self.login():
+                            self.logger.error("✗ Re-login failed")
+                            return self.verification_stats
+
+                # Step 2: Verify all prerequisites in their respective panels
+                if not self.verify_all_prerequisites(csv_data):
+                    self.logger.error("✗ Prerequisite verification failed, aborting import")
+                    return self.verification_stats
 
             # Step 3: Import inventory data in the Inventory panel
-            import_success = self.import_inventory_data(cleaned_csv_path)
-            if not import_success:
-                self.logger.error("✗ Inventory import failed")
+            # Only import if not already imported
+            if not self.completed_stages.get("import", False):
+                import_success = self.import_inventory_data(cleaned_csv_path)
+                if not import_success:
+                    self.logger.error("✗ Inventory import failed")
+            else:
+                self.logger.info("✓ Inventory already imported in previous session")
 
             # Step 4: Generate report
             report = self.generate_report()
@@ -2965,10 +3859,101 @@ class MedicentreV3InventoryImporter:
             self.take_screenshot("import_process_error")
             return self.verification_stats
 
-        finally:
+        finally:    
             if self.driver:
                 self.driver.quit()
                 self.logger.info("Browser session closed")
+
+    def navigate_to_resume_point(self, resume_stage: str, csv_data: List[Dict]):
+        """Navigate directly to the appropriate panel for resumption"""
+        try:
+            self.logger.info(f"Navigating to resume point: {resume_stage}")
+
+            if resume_stage == "accounts":
+                # Navigate to Chart of Accounts panel
+                self.navigate_to_chart_of_accounts()
+                # Then call the accounts verification method
+                if not self.verify_and_create_accounts_in_panel(csv_data):
+                    raise Exception("Failed to resume at accounts stage")
+
+            elif resume_stage == "vat":
+                # Navigate to Taxes panel
+                self.navigate_to_taxes()
+                # Then call the VAT verification method
+                if not self.verify_vat_types_in_panel(csv_data):
+                    raise Exception("Failed to resume at VAT stage")
+                
+            elif resume_stage == "categories":
+                # Navigate to Item Categories panel
+                self.navigate_to_item_categories()
+                # Then call the categories verification method
+                if not self.verify_and_create_categories_in_panel(csv_data):
+                    raise Exception("Failed to resume at categories stage")
+                
+            elif resume_stage == "classes":
+                # Navigate to Item Classes panel
+                self.navigate_to_item_classes()
+                # Then call the classes verification method
+                if not self.verify_and_create_classes_in_panel(csv_data):
+                    raise Exception("Failed to resume at classes stage")
+                
+            elif resume_stage == "units":
+                # Navigate to Unit of Measure panel
+                self.navigate_to_unit_of_measure()
+                # Then call the units verification method
+                if not self.verify_and_create_units_in_panel(csv_data):
+                    raise Exception("Failed to resume at units stage")
+
+            elif resume_stage == "upload":
+                # Navigate directly to Inventory Items panel for upload
+                if not self.navigate_to_inventory_items():
+                    raise Exception("Failed to navigate to inventory items panel")
+                # Upload will be handled by import_inventory_data() later
+            
+            self.logger.info(f"✓ Successfully navigated to resume point: {resume_stage}")
+        
+        except Exception as e:
+            self.logger.error(f"Failed to navigate to resume point '{resume_stage}': {str(e)}")
+            raise
+
+
+def select_start_stage():
+    """Allow user to select which stage to start from"""
+    print("\n" + "=" * 60)
+    print("RESUME OPTIONS")
+    print("=" * 60)
+    print("\nSelect which stage to start from:")
+    print("  1. Full import (start from beginning)")
+    print("  2. Skip prerequisites, start from CSV upload")
+    print("  3. Resume from specific stage:")
+    print("     a) Chart of Accounts")
+    print("     b) VAT Types")
+    print("     c) Item Categories")
+    print("     d) Item Classes")
+    print("     e) Units of Measure")
+    
+    while True:
+        choice = input("\nSelect option (1, 2, or a-e): ").strip().lower()
+        
+        if choice == "1":
+            return None  # Start from beginning
+        
+        elif choice == "2":
+            return "upload"  # Skip prerequisites
+        
+        elif choice in ["a", "b", "c", "d", "e"]:
+            stage_mapping = {
+                "a": "accounts",
+                "b": "vat",
+                "c": "categories",
+                "d": "classes",
+                "e": "units"
+            }
+            return stage_mapping[choice]
+        
+        else:
+            print("Invalid choice. Please enter 1, 2, or a-e.")
+
 
 def run_enhanced_importer():
     """Main function to run the enhanced importer"""
@@ -2976,22 +3961,12 @@ def run_enhanced_importer():
     print("MEDICENTRE v3 ENHANCED INVENTORY IMPORTER")
     print("=" * 60)
     
-    # Ask if user wants to use existing config or create new
-    print("\n--- Configuration ---")
-    use_existing = input("Load existing configuration? (y/n): ").strip().lower() in ["y", "yes"]
-    
-    config = None
-    if use_existing:
-        config_path = input("Config file path (press Enter for default): ").strip()
-        if config_path:
-            config = ConfigLoader.load_config(config_path)
-        else:
-            config = ConfigLoader.load_config()
-    else:
-        config = ConfigLoader.create_new_config(ConfigLoader.DEFAULT_CONFIG_PATH)
+    # Load configuration from environment variables
+    config = ConfigLoader.load_config()
     
     if not config:
-        print("Failed to load/create configuration. Exiting.")
+        print("Failed to load configuration from environment variables.")
+        print("Please create a .env file with the required settings.")
         return
     
     # Validate essential configuration
@@ -3000,7 +3975,7 @@ def run_enhanced_importer():
     
     if missing_fields:
         print(f"\n✗ Missing required configuration fields: {missing_fields}")
-        print("Please create a new configuration with all required fields.")
+        print("Please update your .env file with all required fields.")
         return
     
     # Extract configuration into required format
@@ -3018,6 +3993,10 @@ def run_enhanced_importer():
         "account_mappings": config.get("account_mappings", {}),
         "vat_default_rate": config.get("vat_default_rate", 16),
         "vat_default_tax_code": config.get("vat_default_tax_code", "E"),
+        "enable_screenshots": config.get("enable_screenshots", True),
+        "screenshot_dir": config.get("screenshot_dir", "logs/screenshots"),
+        "log_dir": config.get("log_dir", "logs"),
+        "default_timeout": config.get("default_timeout", 30),
     }
     
     # Get CSV path
@@ -3048,10 +4027,6 @@ def run_enhanced_importer():
         else:
             return
     
-    # Update last CSV path in config
-    config['last_csv_path'] = csv_path
-    ConfigLoader.save_config(config)
-    
     # Dry run option
     print("\n--- Execution Mode ---")
     dry_run_input = input("Dry run (validate only, no changes)? (y/n): ").strip().lower()
@@ -3061,6 +4036,13 @@ def run_enhanced_importer():
         print("\n⚠  DRY RUN MODE - No changes will be made to the system")
     else:
         print("\n⚠  LIVE MODE - Changes will be made to the system")
+    
+    # Resume option
+    print("\n--- Resume Option ---")
+    resume_input = input("Resume from specific stage? (y/n): ").strip().lower()
+    start_stage = None
+    if resume_input in ["y", "yes"]:
+        start_stage = select_start_stage()
     
     confirm = input("\nProceed with import? (y/n): ").strip().lower()
     if confirm not in ["y", "yes"]:
@@ -3077,7 +4059,8 @@ def run_enhanced_importer():
             config.get("base_url", ""),
             credentials,
             importer_config,
-            dry_run
+            dry_run,
+            start_stage
         )
         stats = importer.import_data(csv_path)
         
@@ -3085,7 +4068,7 @@ def run_enhanced_importer():
         print("\n" + "=" * 60)
         print("PROCESS COMPLETE")
         print("=" * 60)
-        print(f"Configuration saved to: {ConfigLoader.DEFAULT_CONFIG_PATH}")
+        print(f"Configuration loaded from environment variables.")
         print(f"Check the logs directory for detailed execution logs and screenshots.")
         print(f"Check the reports directory for the import summary report.")
         print("=" * 60)
